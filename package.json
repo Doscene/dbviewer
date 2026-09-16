@@ -1,0 +1,499 @@
+{
+  "name": "dbviewer",
+  "displayName": "DBViewer - Database Client",
+  "description": "跨平台数据库客户端 (Windows / WSL 双环境)：连接管理、SQL 执行、结果浏览。内置 MySQL、PostgreSQL 驱动，支持驱动插件化扩展。",
+  "version": "0.5.0",
+  "publisher": "doscene-cloud",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "database",
+    "mysql",
+    "postgresql",
+    "sql",
+    "wsl"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "activationEvents": [
+    "onView:dbviewer.connections",
+    "onCommand:dbviewer.addConnection",
+    "onCommand:dbviewer.runQuery",
+    "onCommand:dbviewer.createDatabase",
+    "onCommand:dbviewer.createUser"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dbviewer",
+          "title": "DBViewer",
+          "icon": "media/dbviewer.svg"
+        }
+      ]
+    },
+    "views": {
+      "dbviewer": [
+        {
+          "id": "dbviewer.connections",
+          "name": "连接",
+          "icon": "media/dbviewer.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "dbviewer.connections",
+        "contents": "尚未配置任何数据库连接。\n[添加连接](command:dbviewer.addConnection)\n\n支持 MySQL、PostgreSQL；驱动可扩展。\n提示：在 WSL 中使用 `__windows_host__` 表示 Windows 宿主，在 Windows 中使用 `__wsl_host__` 表示默认 WSL 发行版。"
+      }
+    ],
+    "commands": [
+      {
+        "command": "dbviewer.addConnection",
+        "title": "添加连接",
+        "category": "DBViewer",
+        "icon": "$(add)"
+      },
+      {
+        "command": "dbviewer.editConnection",
+        "title": "编辑连接",
+        "category": "DBViewer",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "dbviewer.duplicateConnection",
+        "title": "复制连接",
+        "category": "DBViewer"
+      },
+      {
+        "command": "dbviewer.deleteConnection",
+        "title": "删除连接",
+        "category": "DBViewer",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "dbviewer.connect",
+        "title": "连接",
+        "category": "DBViewer",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "dbviewer.disconnect",
+        "title": "断开连接",
+        "category": "DBViewer",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "dbviewer.refresh",
+        "title": "刷新",
+        "category": "DBViewer",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dbviewer.newQuery",
+        "title": "新建查询",
+        "category": "DBViewer",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "dbviewer.runQuery",
+        "title": "执行 SQL（全部）",
+        "category": "DBViewer",
+        "icon": "$(play)"
+      },
+      {
+        "command": "dbviewer.runSelection",
+        "title": "执行 SQL（选中）",
+        "category": "DBViewer",
+        "icon": "$(run)"
+      },
+      {
+        "command": "dbviewer.showTableData",
+        "title": "查看数据（前 N 行）",
+        "category": "DBViewer"
+      },
+      {
+        "command": "dbviewer.showTableDdl",
+        "title": "查看建表语句",
+        "category": "DBViewer"
+      },
+      {
+        "command": "dbviewer.openTableInQuery",
+        "title": "生成查询语句",
+        "category": "DBViewer"
+      },
+      {
+        "command": "dbviewer.copyName",
+        "title": "复制名称",
+        "category": "DBViewer",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "dbviewer.dropTable",
+        "title": "删除表",
+        "category": "DBViewer",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "dbviewer.dropDatabase",
+        "title": "删除数据库",
+        "category": "DBViewer",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "dbviewer.createDatabase",
+        "title": "创建数据库…",
+        "category": "DBViewer",
+        "icon": "$(database)"
+      },
+      {
+        "command": "dbviewer.createUser",
+        "title": "创建用户并授权…",
+        "category": "DBViewer",
+        "icon": "$(person-add)"
+      },
+      {
+        "command": "dbviewer.exportResult",
+        "title": "导出结果",
+        "category": "DBViewer",
+        "icon": "$(desktop-download)"
+      },
+      {
+        "command": "dbviewer.clearResult",
+        "title": "清空结果",
+        "category": "DBViewer",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "dbviewer.selectDatabase",
+        "title": "选择数据库…",
+        "category": "DBViewer",
+        "icon": "$(database)"
+      },
+      {
+        "command": "dbviewer.pickConnection",
+        "title": "切换当前查询目标连接",
+        "category": "DBViewer",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "dbviewer.showEnvironment",
+        "title": "诊断运行环境（Windows / WSL）",
+        "category": "DBViewer",
+        "icon": "$(info)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "dbviewer.addConnection",
+          "when": "view == dbviewer.connections",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dbviewer.refresh",
+          "when": "view == dbviewer.connections",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dbviewer.showEnvironment",
+          "when": "view == dbviewer.connections",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "dbviewer.newQuery",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.(connection|database|schema|table)/",
+          "group": "1_query@1"
+        },
+        {
+          "command": "dbviewer.showTableData",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.table",
+          "group": "1_query@2"
+        },
+        {
+          "command": "dbviewer.showTableDdl",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.table",
+          "group": "1_query@3"
+        },
+        {
+          "command": "dbviewer.openTableInQuery",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.table",
+          "group": "1_query@4"
+        },
+        {
+          "command": "dbviewer.connect",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.connectionDisconnected",
+          "group": "2_conn@1"
+        },
+        {
+          "command": "dbviewer.disconnect",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.connectionConnected",
+          "group": "2_conn@1"
+        },
+        {
+          "command": "dbviewer.editConnection",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.connection/",
+          "group": "3_modify@1"
+        },
+        {
+          "command": "dbviewer.duplicateConnection",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.connection/",
+          "group": "3_modify@2"
+        },
+        {
+          "command": "dbviewer.deleteConnection",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.connection/",
+          "group": "3_modify@3"
+        },
+        {
+          "command": "dbviewer.selectDatabase",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.connectionConnected",
+          "group": "2_conn@2"
+        },
+        {
+          "command": "dbviewer.copyName",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.(database|schema|table|column)/",
+          "group": "4_copy@1"
+        },
+        {
+          "command": "dbviewer.dropTable",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.table",
+          "group": "5_manage@1"
+        },
+        {
+          "command": "dbviewer.dropDatabase",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.database",
+          "group": "5_manage@2"
+        },
+        {
+          "command": "dbviewer.createDatabase",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.connectionConnected",
+          "group": "5_manage@3"
+        },
+        {
+          "command": "dbviewer.createUser",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.connectionConnected",
+          "group": "5_manage@4"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "dbviewer.runQuery",
+          "when": "editorLangId == sql",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dbviewer.runSelection",
+          "when": "editorLangId == sql",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dbviewer.pickConnection",
+          "when": "editorLangId == sql",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "dbviewer.runSelection",
+          "when": "editorLangId == sql",
+          "group": "dbviewer@1"
+        },
+        {
+          "command": "dbviewer.runQuery",
+          "when": "editorLangId == sql",
+          "group": "dbviewer@2"
+        },
+        {
+          "command": "dbviewer.pickConnection",
+          "when": "editorLangId == sql",
+          "group": "dbviewer@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "dbviewer.connect",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.disconnect",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.showTableData",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.showTableDdl",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.openTableInQuery",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.copyName",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.editConnection",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.duplicateConnection",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.deleteConnection",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.runSelection",
+          "when": "editorLangId == sql"
+        },
+        {
+          "command": "dbviewer.selectDatabase",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.dropTable",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.dropDatabase",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.createDatabase",
+          "when": "view == dbviewer.connections"
+        },
+        {
+          "command": "dbviewer.createUser",
+          "when": "view == dbviewer.connections"
+        },
+        {
+          "command": "dbviewer.pickConnection",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "dbviewer.runQuery",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "editorLangId == sql"
+      },
+      {
+        "command": "dbviewer.runSelection",
+        "key": "ctrl+alt+shift+e",
+        "mac": "cmd+alt+shift+e",
+        "when": "editorLangId == sql"
+      },
+      {
+        "command": "dbviewer.newQuery",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n"
+      }
+    ],
+    "configuration": {
+      "title": "DBViewer",
+      "properties": {
+        "dbviewer.defaultPageSize": {
+          "type": "number",
+          "default": 200,
+          "markdownDescription": "查询结果默认返回的最大行数（`0` 表示不限制）。建议保持有限值，避免误 `SELECT *` 拉爆内存。"
+        },
+        "dbviewer.queryTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "单条语句的执行超时（毫秒）。"
+        },
+        "dbviewer.connectTimeoutMs": {
+          "type": "number",
+          "default": 15000,
+          "description": "建立连接的超时（毫秒）。"
+        },
+        "dbviewer.driverHostMode": {
+          "type": "string",
+          "enum": [
+            "inProcess",
+            "sidecar"
+          ],
+          "default": "inProcess",
+          "markdownDescription": "驱动运行方式。`inProcess` 直接在扩展宿主中运行（快，推荐）；`sidecar` 在独立子进程中运行，隔离驱动崩溃与阻塞，进程启动方式会自动适配 Windows / WSL。"
+        },
+        "dbviewer.autoResolveHost": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "自动解析主机别名：WSL 中的 `__windows_host__`、Windows 中的 `__wsl_host__`。关闭后需手工填写真实 IP。"
+        },
+        "dbviewer.allowExternalCommand": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "是否允许调用外部命令辅助探测网络环境（`wsl.exe hostname -I`、`wslinfo`）。默认关闭——受管控的机器上安全策略常拦截 `wsl.exe`，开启后可能产生告警或失败。关闭时 `__wsl_host__` 按 `127.0.0.1` 处理（依赖 WSL2 默认的 localhost 转发）。"
+        },
+        "dbviewer.hostAliases": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "自定义主机别名映射，如 `{ \"__prod__\": \"10.0.0.12\" }`。优先级高于内置别名。",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "dbviewer.maxResultRows": {
+          "type": "number",
+          "default": 5000,
+          "description": "结果面板单次展示的最大行数（超出会被截断并提示）。"
+        },
+        "dbviewer.confirmDestructiveStatements": {
+          "type": "boolean",
+          "default": true,
+          "description": "执行 UPDATE / DELETE / DROP / TRUNCATE 等语句前二次确认。"
+        }
+      }
+    },
+    "configurationDefaults": {
+      "files.associations": {
+        "*.sql": "sql"
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile:prod",
+    "compile": "tsc -p ./",
+    "compile:prod": "tsc -p ./ --sourceMap false",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc -p ./ --noEmit",
+    "test:smoke": "node scripts/smoke-test.js",
+    "test:activate": "node scripts/activate-test.js",
+    "test": "npm run compile && npm run test:smoke && npm run test:activate",
+    "package": "npx @vscode/vsce@3 package --allow-missing-repository",
+    "publish": "npx @vscode/vsce@3 publish --allow-missing-repository",
+    "publish:ovsx": "npx ovsx@latest publish"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.5",
+    "pg": "^8.13.1",
+    "pg-connection-string": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/pg": "^8.11.10",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.4.1",
+    "typescript": "^5.6.3"
+  }
+}

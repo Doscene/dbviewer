@@ -1,0 +1,411 @@
+/* 结果面板样式：全部基于 VS Code 主题变量，自动适配浅色 / 深色主题。 */
+
+:root {
+  color-scheme: light dark;
+}
+
+/* 面板里多处用 hidden 属性切换显隐，而这些元素自身带 display:flex/block，
+   不加 !important 会被组件样式盖掉，属性形同虚设 */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  background: var(--vscode-sideBar-background, transparent);
+  flex: 0 0 auto;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.target {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stats {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.sep {
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+
+.export-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.export-label {
+  color: var(--vscode-descriptionForeground);
+}
+
+button,
+select {
+  font-family: inherit;
+  font-size: 0.92em;
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  background: var(--vscode-button-secondaryBackground, transparent);
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-radius: 3px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.15));
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 主操作按钮：写库、执行这类"点下去有实际后果"的动作才配用实心色 */
+button.primary {
+  color: var(--vscode-button-foreground, #fff);
+  background: var(--vscode-button-background, #0e639c);
+  border-color: transparent;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.edit-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.grow {
+  flex: 1 1 auto;
+}
+
+.pagesize {
+  color: var(--vscode-descriptionForeground);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pageinfo {
+  color: var(--vscode-descriptionForeground);
+  min-width: 60px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 8px 0;
+  flex: 0 0 auto;
+  overflow-x: auto;
+}
+
+.tabs:empty {
+  display: none;
+}
+
+.tab {
+  padding: 3px 10px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  border-bottom: none;
+  border-radius: 3px 3px 0 0;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 0.9em;
+}
+
+.tab.active {
+  background: var(--vscode-editor-background);
+  color: var(--vscode-textLink-foreground);
+  border-color: var(--vscode-focusBorder, var(--vscode-panel-border));
+}
+
+.notices {
+  padding: 0 10px;
+  flex: 0 0 auto;
+}
+
+.notices:empty {
+  display: none;
+}
+
+.notice {
+  margin: 6px 0 0;
+  padding: 5px 8px;
+  border-left: 3px solid var(--vscode-editorInfo-foreground, #3794ff);
+  background: var(--vscode-textBlockQuote-background, rgba(128, 128, 128, 0.1));
+  font-size: 0.9em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.notice.error {
+  border-left-color: var(--vscode-errorForeground, #f14c4c);
+  color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.notice.warn {
+  border-left-color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+/* ---------- 执行的 SQL ---------- */
+
+.sql-box {
+  flex: 0 0 auto;
+  max-height: 40vh;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.06));
+}
+
+.sql-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--vscode-textLink-foreground);
+  padding: 2px 4px;
+  font-weight: 600;
+}
+
+button.ghost:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15));
+}
+
+.sql-editor {
+  margin: 0;
+  padding: 6px 10px 8px;
+  min-height: 72px;
+  max-height: 28vh;
+  box-sizing: border-box;
+  resize: vertical;
+  border: none;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  outline: none;
+  color: var(--vscode-editor-foreground, var(--vscode-foreground));
+  background: var(--vscode-editor-background, transparent);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+  line-height: 1.45;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.sql-editor:focus {
+  border-top-color: var(--vscode-focusBorder, #007fd4);
+}
+
+/* 只读时保留可选中复制的能力，但视觉上要和可编辑区分开 */
+.sql-editor.readonly {
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  cursor: default;
+}
+
+.sql-box.collapsed .sql-editor,
+.sql-box.collapsed .edit-log {
+  display: none;
+}
+
+.edit-log {
+  margin: 0 10px 8px;
+  padding: 4px 8px;
+  border-left: 3px solid var(--vscode-charts-green, #4caf50);
+  background: var(--vscode-textBlockQuote-background, rgba(128, 128, 128, 0.1));
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.88em;
+  white-space: pre;
+  overflow: auto;
+}
+
+/* ---------- 可编辑单元格 ---------- */
+
+td.editable {
+  cursor: cell;
+}
+
+td.editable:hover {
+  outline: 1px solid var(--vscode-focusBorder, transparent);
+  outline-offset: -1px;
+}
+
+td.editing {
+  padding: 0;
+  outline: 2px solid var(--vscode-focusBorder, #007fd4);
+  outline-offset: -2px;
+}
+
+.cell-editor {
+  width: 100%;
+  min-width: 60px;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: var(--vscode-input-background, var(--vscode-editor-background));
+  border: none;
+  outline: none;
+  padding: 2px 7px;
+}
+
+td.pending {
+  font-style: italic;
+  background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.33));
+}
+
+.content {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 8px 10px 16px;
+}
+
+.placeholder {
+  color: var(--vscode-descriptionForeground);
+  padding: 24px 4px;
+  font-style: italic;
+}
+
+table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+  width: max-content;
+  min-width: 100%;
+}
+
+th,
+td {
+  border-right: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.28));
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.28));
+  padding: 3px 8px;
+  text-align: left;
+  vertical-align: top;
+  max-width: 480px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+
+th .type {
+  display: block;
+  font-weight: 400;
+  font-size: 0.8em;
+  color: var(--vscode-descriptionForeground);
+}
+
+tbody tr:nth-child(even) {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.06));
+}
+
+tbody tr:hover {
+  background: var(--vscode-list-activeSelectionBackground, rgba(128, 128, 128, 0.18));
+}
+
+td.rowno {
+  color: var(--vscode-descriptionForeground);
+  text-align: right;
+  cursor: default;
+  user-select: none;
+  position: sticky;
+  left: 0;
+  background: var(--vscode-editor-background);
+}
+
+td.null {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+td.cell {
+  cursor: copy;
+}
+
+td.cell:hover {
+  outline: 1px solid var(--vscode-focusBorder, transparent);
+}
+
+.affected {
+  padding: 6px 2px;
+  color: var(--vscode-foreground);
+}
+
+.toast {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  background: var(--vscode-notifications-background, #333);
+  color: var(--vscode-notifications-foreground, #fff);
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.4));
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  pointer-events: none;
+  font-size: 0.9em;
+}
+
+.toast.show {
+  opacity: 1;
+}

@@ -1,0 +1,16 @@
+.vscode/**
+.vscode-test/**
+src/**
+docs/**
+out/test/**
+scripts/**
+.workbuddy/**
+.tmp*
+.tmp-vsix/
+.*.log
+*.vsix
+.gitignore
+tsconfig.json
+**/*.map
+**/*.ts
+!out/**/*.js
