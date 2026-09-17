@@ -1,6 +1,6 @@
 {
   "name": "dbviewer",
-  "displayName": "DBViewer - Database Client",
+  "displayName": "DBViewer",
   "description": "跨平台数据库客户端 (Windows / WSL 双环境)：连接管理、SQL 执行、结果浏览。内置 MySQL、PostgreSQL 驱动，支持驱动插件化扩展。",
   "version": "0.5.0",
   "publisher": "doscene-cloud",
@@ -29,6 +29,7 @@
     "onView:dbviewer.connections",
     "onCommand:dbviewer.addConnection",
     "onCommand:dbviewer.runQuery",
+    "onCommand:dbviewer.openSqlShell",
     "onCommand:dbviewer.createDatabase",
     "onCommand:dbviewer.createUser"
   ],
@@ -104,6 +105,12 @@
         "title": "新建查询",
         "category": "DBViewer",
         "icon": "$(new-file)"
+      },
+      {
+        "command": "dbviewer.openSqlShell",
+        "title": "打开 SQL Shell",
+        "category": "DBViewer",
+        "icon": "$(terminal)"
       },
       {
         "command": "dbviewer.runQuery",
@@ -212,6 +219,11 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "dbviewer.openSqlShell",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.connection/",
+          "group": "1_query@0"
+        },
         {
           "command": "dbviewer.newQuery",
           "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.(connection|database|schema|table)/",
@@ -364,11 +376,15 @@
           "when": "editorLangId == sql"
         },
         {
-          "command": "dbviewer.selectDatabase",
+          "command": "dbviewer.dropTable",
           "when": "false"
         },
         {
-          "command": "dbviewer.dropTable",
+          "command": "dbviewer.openSqlShell",
+          "when": "view == dbviewer.connections"
+        },
+        {
+          "command": "dbviewer.selectDatabase",
           "when": "false"
         },
         {

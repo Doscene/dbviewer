@@ -909,6 +909,182 @@ function makeContext() {
     assert.strictEqual(writtenFiles.length, 0);
   });
 
+  // ------------------------------------------------------------ SQL Shell
+
+  console.log('\n--- SQL Shell ---');
+
+  const { SqlShellPanel } = require(path.join(outDir, 'views', 'sqlShellPanel.js'));
+  /** 记录扩展侧注入的回调被调用的情况。 */
+  const shellCalls = { executed: [], switched: [] };
+
+  const shellHost = {
+    connectionName: '本地 MySQL',
+    driverName: 'MySQL',
+    target: 'root@127.0.0.1:3306/app',
+    environment: 'Windows 原生',
+    database: 'app',
+    metaHelp: '可用命令：\\? \\l \\dt \\c \\clear \\q',
+    execute: async (sql) => {
+      shellCalls.executed.push(sql);
+      if (sql === 'boom') {
+        return { status: 'error', message: '表不存在', hints: ['· 检查表名'] };
+      }
+      if (sql === 'no') {
+        return { status: 'cancelled' };
+      }
+      return {
+        status: 'ok',
+        result: {
+          sets: [
+            {
+              statement: 'SELECT',
+              sql: 'SELECT `id`, `name` FROM `app`.`users` LIMIT 2',
+              fields: ['id', 'name'],
+              rows: [
+                { id: 1, name: '张三' },
+                { id: 2, name: '李四' },
+              ],
+              rowCount: 5,
+            },
+          ],
+          durationMs: 7,
+          sql,
+          truncated: false,
+        },
+      };
+    },
+    listDatabases: async () => ['information_schema', 'app'],
+    listTables: async () => ['app.users', 'app.orders'],
+    switchDatabase: async (name) => {
+      shellCalls.switched.push(name);
+      return `已切换到数据库 ${name}`;
+    },
+  };
+
+  webviewPanels.length = 0;
+  const shell = SqlShellPanel.open(Uri.file(root), 'profile-1', shellHost);
+  const shellView = webviewPanels[webviewPanels.length - 1];
+
+  await check('连接节点右键菜单包含打开 SQL Shell', () => {
+    const item = packageJson.contributes.menus['view/item/context'].find(
+      (m) => m.command === 'dbviewer.openSqlShell',
+    );
+    assert.ok(item, '未在树节点右键菜单声明 openSqlShell');
+    assert.ok(item.when.includes('view == dbviewer.connections'), `when 未限定树视图：${item.when}`);
+    assert.ok(item.when.includes('^dbviewer\\.connection'), `when 未匹配连接节点：${item.when}`);
+  });
+
+  await check('SQL Shell 面板创建成功且标题带连接名', () => {
+    assert.strictEqual(shellView.viewType, 'dbviewer.sqlShell');
+    assert.strictEqual(shellView.title, 'SQL Shell · 本地 MySQL');
+  });
+
+  await check('SQL Shell 界面含输入框、执行与元命令入口', () => {
+    const html = shellView.webview.html;
+    for (const id of ['input', 'runBtn', 'clearBtn', 'helpBtn', 'output', 'bootstrap']) {
+      assert.ok(html.includes(`id="${id}"`), `SQL Shell 缺少 #${id}`);
+    }
+  });
+
+  await check('引导数据带连接信息与元命令帮助', () => {
+    const matched = /<script type="application\/json" id="bootstrap">([\s\S]*?)<\/script>/.exec(shellView.webview.html);
+    assert.ok(matched, '未找到 bootstrap 数据块');
+    const data = JSON.parse(matched[1]);
+    assert.strictEqual(data.host.connectionName, '本地 MySQL');
+    assert.strictEqual(data.host.database, 'app');
+    assert.ok(data.host.metaHelp.includes('\\q'), '缺少元命令帮助');
+  });
+
+  await check('提交 SQL 经命令层回调执行并回传结果', async () => {
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'submit', sql: 'SELECT * FROM users' });
+    assert.deepStrictEqual(shellCalls.executed, ['SELECT * FROM users'], 'SQL 未下发到命令层');
+
+    const entry = shellView.posted.filter((m) => m.type === 'entry').pop();
+    assert.ok(entry, '未回传条目');
+    assert.strictEqual(entry.entry.status, 'ok');
+    assert.strictEqual(entry.entry.durationMs, 7);
+    assert.deepStrictEqual(entry.entry.sets[0].rows, [[1, '张三'], [2, '李四']], '行未按列顺序投影');
+    assert.strictEqual(entry.entry.sets[0].rowCount, 5);
+  });
+
+  await check('执行失败在输出流中显示错误与排查建议', async () => {
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'submit', sql: 'boom' });
+    const entry = shellView.posted.filter((m) => m.type === 'entry').pop().entry;
+    assert.strictEqual(entry.status, 'error');
+    assert.strictEqual(entry.message, '表不存在');
+    assert.deepStrictEqual(entry.hints, ['· 检查表名']);
+  });
+
+  await check('取消危险语句不显示为错误', async () => {
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'submit', sql: 'no' });
+    const entry = shellView.posted.filter((m) => m.type === 'entry').pop().entry;
+    assert.strictEqual(entry.status, 'notice');
+    assert.ok(entry.message.includes('取消'));
+  });
+
+  await check('元命令 \\l / \\dt 在扩展侧处理，不发给驱动', async () => {
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'submit', sql: '\\l' });
+    const list = shellView.posted.filter((m) => m.type === 'entry').pop().entry;
+    assert.strictEqual(list.status, 'notice');
+    assert.ok(list.message.includes('information_schema'), '未列出数据库');
+
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'submit', sql: '\\dt' });
+    const tables = shellView.posted.filter((m) => m.type === 'entry').pop().entry;
+    assert.ok(tables.message.includes('app.users'), '未列出数据表');
+
+    assert.ok(!shellCalls.executed.includes('\\l'), '元命令被误发给驱动');
+  });
+
+  await check('\\c 切库会下发到命令层', async () => {
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'submit', sql: '\\c analytics' });
+    assert.deepStrictEqual(shellCalls.switched, ['analytics']);
+    const entry = shellView.posted.filter((m) => m.type === 'entry').pop().entry;
+    assert.ok(entry.message.includes('analytics'));
+  });
+
+  await check('ready 回放输出缓冲，历史不丢', async () => {
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'ready' });
+    const hydrate = shellView.posted.find((m) => m.type === 'hydrate');
+    assert.ok(hydrate, '未回放输出缓冲');
+    assert.ok(hydrate.entries.length >= 5, `输出缓冲不完整：${hydrate.entries.length}`);
+    assert.strictEqual(hydrate.host.connectionName, '本地 MySQL');
+  });
+
+  await check('清空输出后缓冲同步清空', async () => {
+    await shellView.send({ type: 'clear' });
+    shellView.posted.length = 0;
+    await shellView.send({ type: 'ready' });
+    const hydrate = shellView.posted.find((m) => m.type === 'hydrate');
+    assert.strictEqual(hydrate.entries.length, 0);
+  });
+
+  await check('updateHost 推送新的目标库信息', () => {
+    shellView.posted.length = 0;
+    shell.updateHost({ database: 'analytics', target: 'root@127.0.0.1:3306/analytics' });
+    const message = shellView.posted.filter((m) => m.type === 'host').pop();
+    assert.ok(message, '未推送 host 消息');
+    assert.strictEqual(message.host.database, 'analytics');
+  });
+
+  await check('同一连接重复打开复用面板，关闭后可重建', () => {
+    webviewPanels.length = 0;
+    SqlShellPanel.open(Uri.file(root), 'profile-1', shellHost);
+    assert.strictEqual(webviewPanels.length, 0, '重复打开不应创建新面板');
+
+    shell.dispose();
+    webviewPanels.length = 0;
+    SqlShellPanel.open(Uri.file(root), 'profile-1', shellHost);
+    assert.strictEqual(webviewPanels.length, 1, '面板关闭后应能重新创建');
+    SqlShellPanel.disposeAll();
+  });
+
   await check('deactivate() 无异常', async () => {
     await extension.deactivate();
   });

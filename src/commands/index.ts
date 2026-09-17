@@ -10,7 +10,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { ConnectionManager } from '../core/connectionManager';
+import { ConnectionManager, ConnectResult } from '../core/connectionManager';
 import { ConnectionInput, ConnectionStore } from '../core/connectionStore';
 import { DriverRegistry } from '../core/driverRegistry';
 import { EditTarget, resolveEditTarget } from '../core/editTarget';
@@ -22,6 +22,7 @@ import {
   CreateUserRequest,
   DatabaseError,
   GrantRequest,
+  IDatabaseDriver,
   QueryResult,
   QueryTarget,
 } from '../core/types';
@@ -31,6 +32,7 @@ import { DbTreeItem } from '../views/connectionsTree';
 import { ConnectionFormHost, ConnectionFormPanel, ConnectionFormValues } from '../views/connectionFormPanel';
 import { ManagementFormPanel, ManagementFormValues } from '../views/managementFormPanel';
 import { ResultPanel } from '../views/resultPanel';
+import { ShellExecutionOutcome, SqlShellPanel } from '../views/sqlShellPanel';
 
 export interface CommandDeps {
   context: vscode.ExtensionContext;
@@ -220,6 +222,14 @@ export function registerCommands(deps: CommandDeps): vscode.Disposable[] {
     const line = doc.lineCount - 1;
     editor.selection = new vscode.Selection(line, 0, line, 0);
     updateStatus(editor, status, store);
+  });
+
+  register('dbviewer.openSqlShell', async (node?: DbTreeItem) => {
+    // 树视图右键带节点；命令面板调用时没有节点，走「唯一连接直接用、多个则让用户选」
+    const profileId = await resolveProfileIdOrPrompt(deps, node, '选择要打开 SQL Shell 的连接');
+    if (profileId) {
+      await openSqlShell(deps, profileId);
+    }
   });
 
   register('dbviewer.runQuery', async () => {
@@ -563,6 +573,27 @@ async function reportConnectionError(err: unknown, deps: CommandDeps, profileId:
 }
 
 /**
+ * 危险语句的二次确认。
+ *
+ * 抽成独立函数是因为结果面板与 SQL Shell 都要走这一步：两套判定早晚会漂移，
+ * 而漂移的方向通常是「某个入口漏了确认」。
+ */
+async function confirmDestructive(sql: string): Promise<boolean> {
+  const confirmNeeded = vscode.workspace
+    .getConfiguration('dbviewer')
+    .get<boolean>('confirmDestructiveStatements', true);
+  if (!confirmNeeded || !isDestructiveStatement(sql)) {
+    return true;
+  }
+  const answer = await vscode.window.showWarningMessage(
+    '即将执行写操作，可能修改或删除数据。确认继续？',
+    { modal: true, detail: sql.length > 800 ? `${sql.slice(0, 800)}…` : sql },
+    '执行',
+  );
+  return answer === '执行';
+}
+
+/**
  * 执行 SQL：解析目标连接 → 危险语句确认 → 执行 → 渲染结果。
  *
  * `editFallback` 由调用方在已知目标表时传入（树视图的「查看数据」），
@@ -591,18 +622,8 @@ async function runSql(
     return;
   }
 
-  const confirmNeeded = vscode.workspace
-    .getConfiguration('dbviewer')
-    .get<boolean>('confirmDestructiveStatements', true);
-  if (confirmNeeded && isDestructiveStatement(text)) {
-    const answer = await vscode.window.showWarningMessage(
-      '即将执行写操作，可能修改或删除数据。确认继续？',
-      { modal: true, detail: text.length > 800 ? `${text.slice(0, 800)}…` : text },
-      '执行',
-    );
-    if (answer !== '执行') {
-      return;
-    }
+  if (!(await confirmDestructive(text))) {
+    return;
   }
 
   const panel = ResultPanel.show(deps.context.extensionUri, vscode.ViewColumn.Beside);
@@ -678,6 +699,142 @@ async function deriveEditTarget(
   }
   // 用实际执行的 SQL（可能已被追加 LIMIT）而不是编辑器里的原文，两者表名一致
   return resolveEditTarget(driver, set.sql || result.sql, set.fields, fallback);
+}
+
+// ---------------------------------------------------------------- SQL Shell
+
+/** SQL Shell 的元命令帮助文案：单一来源在扩展侧，前端只负责显示。 */
+const SHELL_META_HELP = [
+  '可用命令：',
+  '  \\?            显示本帮助',
+  '  \\l            列出数据库',
+  '  \\dt           列出当前库的数据表',
+  '  \\c <数据库>   切换目标数据库（会重建连接）',
+  '  \\clear        清空输出',
+  '  \\q            关闭本面板（quit / exit 同义）',
+  '',
+  '快捷键：Enter 或 Ctrl+Enter 执行，Shift+Enter 换行，↑ / ↓ 翻历史。',
+].join('\n');
+
+/**
+ * 打开 SQL Shell。
+ *
+ * 未连接时先连：shell 的全部价值都建立在「已经连上」这件事上，
+ * 先开一个连不上的空面板、再让用户回去点连接，纯属多一步。
+ */
+async function openSqlShell(deps: CommandDeps, profileId: string): Promise<void> {
+  const { manager, store, env, refreshTree } = deps;
+  const profile = store.get(profileId);
+  if (!profile) {
+    return;
+  }
+
+  let connected: ConnectResult;
+  try {
+    connected = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: '正在建立数据库连接…', cancellable: false },
+      () => manager.connect(profileId),
+    );
+  } catch (err) {
+    refreshTree();
+    await reportConnectionError(err, deps, profileId);
+    return;
+  }
+  refreshTree();
+
+  const driver = connected.session.driver;
+  const describe = (): string => {
+    const session = manager.session(profileId);
+    const database = session.profile.database;
+    return `${session.profile.user}@${session.profile.host}:${session.profile.port}${database ? `/${database}` : ''}`;
+  };
+
+  // 闭包内要回写这个引用（切库后刷新标题、面板关闭后清引用），显式初始化以满足严格模式
+  let shell: SqlShellPanel | undefined = undefined;
+  shell = SqlShellPanel.open(deps.context.extensionUri, profileId, {
+    connectionName: profile.name,
+    driverName: driver?.displayName ?? profile.driver,
+    target: describe(),
+    environment: env.describe,
+    database: manager.session(profileId).profile.database,
+    metaHelp: SHELL_META_HELP,
+    execute: (sql) => executeForShell(deps, profileId, sql),
+
+    listDatabases: async () => (await requireDriver(manager, profileId).listDatabases()).map((db) => db.name),
+
+    listTables: async () => {
+      const current = requireDriver(manager, profileId);
+      // MySQL 的表挂在 database 下、PG 挂在 schema 下：按能力位选目标，
+      // 命令层不出现「驱动是不是 postgresql」这类分支
+      const target: QueryTarget = current.capabilities.schemas
+        ? {}
+        : { database: manager.session(profileId).profile.database };
+      const tables = await current.listTables(target);
+      const lines = tables
+        .slice(0, 500)
+        .map((table) => (current.capabilities.schemas && table.schema ? `${table.schema}.${table.name}` : table.name));
+      if (tables.length > lines.length) {
+        lines.push(`… 共 ${tables.length} 个对象，仅列出前 ${lines.length} 个`);
+      }
+      return lines;
+    },
+
+    switchDatabase: async (name) => {
+      const { session: next } = await manager.connect(profileId, name);
+      refreshTree();
+      shell?.updateHost({ database: next.profile.database, target: describe() });
+      return `已切换到数据库 ${next.profile.database ?? name}`;
+    },
+
+    onDispose: () => {
+      shell = undefined;
+    },
+  });
+}
+
+/**
+ * Shell 内执行 SQL。
+ *
+ * 与结果面板同源的处理链路，只是结果交给 shell 渲染。错误在这里被翻译成结构化返回值
+ * 而不是抛出——shell 要把错误留在输出流里，弹模态提示会打断连续操作。
+ */
+async function executeForShell(
+  deps: CommandDeps,
+  profileId: string,
+  sql: string,
+): Promise<ShellExecutionOutcome> {
+  const { manager, store, refreshTree } = deps;
+  const profile = store.get(profileId);
+  if (!profile) {
+    return { status: 'error', message: '连接配置已不存在，请重新打开 SQL Shell' };
+  }
+  if (!(await confirmDestructive(sql))) {
+    return { status: 'cancelled' };
+  }
+  try {
+    const result = await vscode.window.withProgress(
+      // 状态栏进度而不是通知：shell 是连续交互，每次执行都弹通知会一直抢焦点
+      { location: vscode.ProgressLocation.Window, title: '正在执行 SQL…' },
+      () => manager.execute(profileId, sql),
+    );
+    refreshTree();
+    return { status: 'ok', result };
+  } catch (err) {
+    refreshTree();
+    return {
+      status: 'error',
+      message: (err as Error).message,
+      hints: manager.resolver.suggestions(profile.host),
+    };
+  }
+}
+
+function requireDriver(manager: ConnectionManager, profileId: string): IDatabaseDriver {
+  const driver = manager.session(profileId).driver;
+  if (!driver) {
+    throw new DatabaseError('连接未就绪，请重新连接后重试', 'ENOT_CONNECTED');
+  }
+  return driver;
 }
 
 /** 确定 SQL 应发往哪个连接：优先文档绑定，其次让用户选择。 */async function resolveTargetProfileId(deps: CommandDeps): Promise<string | undefined> {
@@ -961,7 +1118,22 @@ function buildDiagnostics(deps: CommandDeps): string[] {
 
 // ---------------------------------------------------------------- 管理操作辅助函数
 
+/** 管理类命令入口：与 SQL Shell 共用同一套「取目标连接」规则。 */
 async function resolveProfileIdForManagement(deps: CommandDeps, node?: DbTreeItem): Promise<string | undefined> {
+  return resolveProfileIdOrPrompt(deps, node, '选择目标连接');
+}
+
+/**
+ * 取目标连接 id。
+ *
+ * 节点自带就用节点的（树视图右键）；否则唯一连接直接用、多个才让用户选。
+ * shell、建库、建用户三个入口共享它，避免各自实现出不同的兜底行为。
+ */
+async function resolveProfileIdOrPrompt(
+  deps: CommandDeps,
+  node: DbTreeItem | undefined,
+  title: string,
+): Promise<string | undefined> {
   const { store } = deps;
   const profileId = node?.payload?.profileId;
   if (profileId && store.get(profileId)) {
@@ -977,7 +1149,7 @@ async function resolveProfileIdForManagement(deps: CommandDeps, node?: DbTreeIte
   }
   const picked = await vscode.window.showQuickPick(
     profiles.map((p) => ({ label: p.name, description: `${p.driver} · ${p.user}@${p.host}:${p.port}` })),
-    { title: '选择目标连接' },
+    { title },
   );
   if (!picked) {
     return undefined;

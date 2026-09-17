@@ -19,6 +19,7 @@ import { loadExternalDrivers, registerBuiltinDrivers } from './drivers';
 import { detectEnvironment } from './platform/environment';
 import { ConnectionsTreeProvider } from './views/connectionsTree';
 import { ResultPanel } from './views/resultPanel';
+import { SqlShellPanel } from './views/sqlShellPanel';
 
 let activeManager: ConnectionManager | undefined;
 
@@ -93,7 +94,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export async function deactivate(): Promise<void> {
-  // 断开所有连接并回收结果面板，避免子进程 / socket 残留
+  // 断开所有连接并回收面板，避免子进程 / socket 残留
+  SqlShellPanel.disposeAll();
   if (activeManager) {
     await activeManager.disposeAll();
     activeManager = undefined;

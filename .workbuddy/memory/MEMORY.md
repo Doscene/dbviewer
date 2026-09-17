@@ -34,6 +34,8 @@ VS Code 数据库客户端插件，**必须同时兼容 Windows 原生与 WSL �
 19. **结果面板里执行的 SQL 必须由命令层注入的回调（`ResultContext.executeSql`）下发**，面板不得自己去调驱动——否则危险语句二次确认、超时、错误翻译全被绕过。面板 SQL 文本框只在 `syncSqlEditor()` 时回填，`render()` 中禁止回填（会冲掉用户输入）。
 20. Excel 导出遵守 OOXML `xsd:sequence`：`cols` 在 `sheetData` 前、`autoFilter` 在其后；`fills` 第 0/1 项固定为 `none`/`gray125`。`HTMLElement.hidden` 在 Webview 里要配 `[hidden] { display: none !important; }`。
 21. VS Code **树视图没有双击事件**，`TreeItem.command` 单击即触发；连接节点只在未连接态挂 `connect` 命令。SQL 编辑器的执行入口走 `menus."editor/title"`（`when: editorLangId == sql`）。
+22. **SQL Shell（`views/sqlShellPanel.ts`）与结果面板同一条边界**：面板只做输入与渲染，执行/只读拦截/危险语句确认全由命令层注入的 `SqlShellHost.execute` 完成；元命令（`\?` `\l` `\dt` `\c` `\clear` `\q`）在扩展侧处理，帮助文案单一来源是 `commands/index.ts` 的 `SHELL_META_HELP`；单条输出最多推 200 行（`MAX_SHELL_ROWS`）。每个连接一个实例（`Map<profileId, SqlShellPanel>`）。
+23. 危险语句二次确认统一走 `confirmDestructive()`（`commands/index.ts`）——结果面板与 SQL Shell 共用，**禁止在入口各自实现**；`resolveProfileIdOrPrompt()` 是「取目标连接」的唯一入口（树节点 → 单连接直用 → 多连接让用户选 → 无连接引导创建）。
 
 ## 命令
 
@@ -69,7 +71,8 @@ npm run package      # 出 vsix（= npx @vscode/vsce@3 package --allow-missing-r
   - 市场侧 publisher 的 **display name（展示名）允许点号**，所以品牌仍可显示成 `doscene.cloud`；只有机器可读 ID 受限。
   - 扩展 id 最终是 `doscene-cloud.dbviewer`，与 package.json 的 `publisher` + `name` 一致。
 - `repository` 字段仍缺（因此所有 vsce 命令都要带 `--allow-missing-repository`，否则会交互式提问卡住）。补上它才能让市场页面显示仓库链接、README 相对链接正常解析。
-- git 仓库已 init 但**0 commit**；`vsce publish minor` 会走 `npm version` 建 commit+tag，需先做一次初始提交。
+- git 仓库已有初始提交（`b0ef5be` "Init commit"，当前唯一提交）；`vsce publish minor` 会走 `npm version` 建 commit+tag，工作区必须干净。
+- **仓库 git 身份统一用 `doscene` / `doscene@outlook.com`**（写在 `--local`，不改全局）；`origin = https://github.com/Doscene/dbviewer.git`，尚未 push。若之后改写历史，push 需 `--force-with-lease`。
 - 脚本：`npm run publish`（Marketplace）、`npm run publish:ovsx`（Open VSX）。
-- Open VSX 需先在 open-vsx.org 用 GitHub 登录 + 签 Eclipse 发布者协议，再 `ovsx create-namespace srdcloud -p <token>`（namespace 必须先建，否则发布被拒）。
+- Open VSX 需先在 open-vsx.org 用 GitHub 登录 + 签 Eclipse 发布者协议，再 `ovsx create-namespace doscene-cloud -p <token>`（namespace 必须先建，否则发布被拒；注意与 publisher ID 保持一致，旧值 `srdcloud` 已废弃）。
 - `docs/**` 已排除出包（两张设计稿 PNG，164.6 KB，运行时用不到）。
