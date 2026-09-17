@@ -1,10 +1,17 @@
 {
-  "name": "dbviewer",
+  "name": "dbviewer-dsc",
   "displayName": "DBViewer",
   "description": "跨平台数据库客户端 (Windows / WSL 双环境)：连接管理、SQL 执行、结果浏览。内置 MySQL、PostgreSQL 驱动，支持驱动插件化扩展。",
   "version": "0.5.0",
   "publisher": "doscene-cloud",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Doscene/dbviewer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Doscene/dbviewer/issues"
+  },
   "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.90.0"

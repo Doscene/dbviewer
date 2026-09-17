@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
-## [0.5.0] - 2026-09-16
+## [0.5.0] - 2026-09-17
 
 ### 新增
 
@@ -12,16 +12,22 @@
 - 扩展 `IDatabaseDriver` 与 `DriverCapabilities`：新增 `manageDatabase`、`manageUser`、`dropTable`、`dropDatabase`、`createDatabase`、`createUser`、`grantPrivileges`。
 - Sidecar 模式同步支持上述管理操作：代理层与 sidecar host 增加对应 RPC，inProcess / sidecar 行为一致。
 - 新增 `views/managementFormPanel.ts`、`media/managementForm.js`、`media/managementForm.css`。
+- **SQL Shell**：连接节点右键打开交互式终端面板，输入即执行、结果按流式追加，支持取消与历史回溯。元命令 `\?` `\l` `\dt` `\c` `\clear` `\q` 在扩展侧直接处理，不会下发给驱动；`\c` 切换目标库后同步刷新面板标题与目标信息。
+  - 执行链路与结果面板完全一致：只读拦截、危险语句二次确认、超时、错误翻译全部走命令层注入的回调，面板自身不直接触碰驱动。
+  - 单条输出最多保留 200 行，避免大结果集撑爆 Webview；每个连接复用同一个面板实例，关闭后可重新打开。
+  - 新增 `views/sqlShellPanel.ts`、`media/sqlShell.js`、`media/sqlShell.css`。
 
 ### 变更
 
 - `package.json` 注册 4 条新命令（`dropTable`、`dropDatabase`、`createDatabase`、`createUser`）与对应右键菜单；`activationEvents` 增加 `onCommand:dbviewer.createDatabase` / `createUser`。
 - `.vscodeignore` 追加 `.tmp-vsix/` 与 `.*.log`，避免打包时混入临时目录与构建日志。
+- **扩展内部名 `name` 由 `dbviewer` 改为 `dbviewer-dsc`**：Marketplace 对扩展名是全局唯一约束。`dbviewer` 与 `db-viewer` 连续被服务端以 `The extension '<name>' already exists in the Marketplace` 拒绝 —— 公开检索看不到任何同名扩展（已下架者的名字会被市场永久保留），占用者也非本组织的历史 publisher（`srdcloud.*` / `doscene.*` 均查无此扩展）。结论是 `db` 系通用词已被批量占位，只能改带品牌前缀的名字，`dsc` 取 `doscene.cloud` 缩写。命令 ID、配置项前缀、视图 ID 仍全部保持 `dbviewer.*`，仅扩展标识符变化。
 
 ### 测试
 
-- `npm test` 全绿：52 项冒烟测试 + 51 项激活测试通过。
+- `npm test` 全绿：52 项冒烟测试 + 64 项激活测试通过。
 - `vsce package --out dbviewer-0.5.0.vsix` 成功，包内无日志/临时目录残留。
+- 首次发布至 Visual Studio Marketplace，扩展 ID `doscene-cloud.dbviewer-dsc`。
 
 ## [0.4.0] - 2026-09-16
 

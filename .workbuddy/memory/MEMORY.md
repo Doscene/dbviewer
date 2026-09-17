@@ -42,7 +42,7 @@ VS Code 数据库客户端插件，**必须同时兼容 Windows 原生与 WSL �
 ```powershell
 npm run compile      # tsc 编译
 npm run test:smoke   # 52 项核心逻辑测试（纯 Node）
-npm run test:activate # 51 项激活 + 表单 + 结果面板测试（mock vscode）
+npm run test:activate # 64 项激活 + 表单 + 结果面板 + SQL Shell 测试（mock vscode）
 npm test             # 编译 + 两项测试
 npm run package      # 出 vsix（= npx @vscode/vsce@3 package --allow-missing-repository）
 ```
@@ -65,14 +65,31 @@ npm run package      # 出 vsix（= npx @vscode/vsce@3 package --allow-missing-r
 
 ## 发布（插件市场）
 
-- 市场图标 `media/icon.png`（256×256 PNG），由 `scripts/build-icon.js` 生成（零依赖手写 PNG 编码器）。**市场只认 PNG ≥128×128，SVG 不行**；改配色改脚本再跑，别手改位图。
-- `publisher` = **`doscene-cloud`**（品牌 `doscene.cloud` 去点后的形式）。必须与市场侧创建的 publisher ID 完全一致，且**创建后不可改**。
-  - **publisher ID 禁止点号**：vsce 校验正则 `/^[a-z0-9][a-z0-9-]*$/i`，`doscene.cloud` 会被直接拒（`Invalid extension "publisher"`）。点号是 `publisher.name` 的分隔符。域名里的点只能换成 `-` 或直接去掉。
-  - 市场侧 publisher 的 **display name（展示名）允许点号**，所以品牌仍可显示成 `doscene.cloud`；只有机器可读 ID 受限。
-  - 扩展 id 最终是 `doscene-cloud.dbviewer`，与 package.json 的 `publisher` + `name` 一致。
-- `repository` 字段仍缺（因此所有 vsce 命令都要带 `--allow-missing-repository`，否则会交互式提问卡住）。补上它才能让市场页面显示仓库链接、README 相对链接正常解析。
-- git 仓库已有初始提交（`b0ef5be` "Init commit"，当前唯一提交）；`vsce publish minor` 会走 `npm version` 建 commit+tag，工作区必须干净。
-- **仓库 git 身份统一用 `doscene` / `doscene@outlook.com`**（写在 `--local`，不改全局）；`origin = https://github.com/Doscene/dbviewer.git`，尚未 push。若之后改写历史，push 需 `--force-with-lease`。
-- 脚本：`npm run publish`（Marketplace）、`npm run publish:ovsx`（Open VSX）。
-- Open VSX 需先在 open-vsx.org 用 GitHub 登录 + 签 Eclipse 发布者协议，再 `ovsx create-namespace doscene-cloud -p <token>`（namespace 必须先建，否则发布被拒；注意与 publisher ID 保持一致，旧值 `srdcloud` 已废弃）。
-- `docs/**` 已排除出包（两张设计稿 PNG，164.6 KB，运行时用不到）。
+**已发布**：`doscene-cloud.dbviewer-dsc` v0.5.0（2026-09-17 首次发布）
+
+- 市场页：https://marketplace.visualstudio.com/items?itemName=doscene-cloud.dbviewer-dsc
+- 管理页：https://marketplace.visualstudio.com/manage/publishers/doscene-cloud/extensions/dbviewer-dsc/hub
+
+### 扩展 `name` 全局唯一 —— 通用词基本已被占
+
+- 撞名时服务端直接拒绝：`The extension '<name>' already exists in the Marketplace. Please use a different 'name' in the package.json file`。
+- **实测不可用**：`dbviewer`、`db-viewer`。占用者**既查不到也无法预验证**：`vsce show`、`extensionquery`（带 `Unpublished` / `IncludeNameConflictInfo` 标志）、公开文本搜索全部看不到（已下架扩展的名字会被市场永久保留且不可见）；也非本组织历史 publisher（`srdcloud.*` / `doscene.*` 逐个查均 not found）。
+- **结论：`db` 系通用词不要再试，直接用品牌前缀**（现名 `dbviewer-dsc`，`dsc` = doscene.cloud）。改 `name` 不影响命令 ID、配置项前缀、视图 ID —— 那些必须一律保持 `dbviewer.*`。
+- 查询过滤器备忘：`filterType 10` = SearchText 可用；`2` = ExtensionName 对未收录者无效；`7` 不存在（400）。`gallery/publishers/<id>` 端点在本机网络对任何 publisher 恒 404（`ms-python` 亦然），不能当存在性判据。
+
+### 凭证与命令
+
+- `publisher` = **`doscene-cloud`**，市场侧创建后不可改。**ID 禁止点号**（vsce 正则 `/^[a-z0-9][a-z0-9-]*$/i`）；市场的 display name 允许点号，品牌仍显示成 `doscene.cloud`。
+- PAT 在 Azure DevOps 创建：**Organization 必须选 `All accessible organizations`**，Scopes 勾 **Marketplace → Manage**。
+  - `vsce verify-pat` **会失败但发布仍成功** —— 它额外要求 `View user permissions on a resource` 权限。别据此判定 PAT 无效。
+- 发布：`$env:VSCE_PAT="<pat>"; npx @vscode/vsce@3 publish --packagePath <vsix>` —— 直接推已打好的包，跳过重打包与 git 工作区检查。成功输出 `DONE Published <id> v<x.y.z>`；市场公开索引有延迟，`vsce show` 几分钟内仍 `not found`。
+- **`vsce package --out <dir>/<file>.vsix` 的 `<dir>` 必须先存在**，否则 `ENOENT`。日志里 "Files included in the VSIX:" 上方单独那行输出文件名不是包内容。
+- 版本不支持 semver 预发布后缀（不能 `0.5.0-beta.1`）；预发布用 `vsce publish --pre-release`。
+
+### 其它
+
+- 市场图标 `media/icon.png`（256×256 PNG，`scripts/build-icon.js` 生成）。**市场只认 PNG ≥128×128，SVG 不行**。
+- `repository` + `bugs` 已补（`https://github.com/Doscene/dbviewer.git`），不必再带 `--allow-missing-repository`（脚本里留着无害）。**仓库尚未 push，市场页的仓库链接在 push 前 404**。
+- git 现有 2 个提交（`b0ef5be` Init、`6e159b6` SQL Shell）；`vsce publish <version>` 走 `npm version` 建 commit+tag，要求工作区干净。仓库身份 `doscene` / `doscene@outlook.com`（local）。
+- 脚本：`npm run publish`（Marketplace）、`npm run publish:ovsx`（Open VSX）；Open VSX 需先签 Eclipse 发布者协议并 `ovsx create-namespace doscene-cloud -p <token>`（旧值 `srdcloud` 已废弃）。
+- `docs/**` 已排除出包。
