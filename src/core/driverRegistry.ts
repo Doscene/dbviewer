@@ -99,6 +99,9 @@ export class DriverRegistry {
     if (caps.columns && typeof driver.listColumns !== 'function') {
       problems.push(`驱动 ${driver.id} 声明支持列元数据，但未实现 listColumns()`);
     }
+    if (caps.backup && typeof driver.backupChunks !== 'function') {
+      problems.push(`驱动 ${driver.id} 声明支持备份，但未实现 backupChunks()`);
+    }
     // 声明支持 schema 才要求实现；不支持的驱动（如 MySQL）本就不该有这个方法
     if (caps.schemas && typeof driver.listSchemas !== 'function') {
       problems.push(`驱动 ${driver.id} 声明支持 schema，但未实现 listSchemas()`);

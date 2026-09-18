@@ -28,6 +28,7 @@ import {
 } from '../core/types';
 import { RuntimeEnvironment } from '../platform/environment';
 import { HOST_ALIAS_WINDOWS, HOST_ALIAS_WSL } from '../platform/hostResolver';
+import { registerBackupCommands } from './backup';
 import { DbTreeItem } from '../views/connectionsTree';
 import { ConnectionFormHost, ConnectionFormPanel, ConnectionFormValues } from '../views/connectionFormPanel';
 import { ManagementFormPanel, ManagementFormValues } from '../views/managementFormPanel';
@@ -516,6 +517,12 @@ export function registerCommands(deps: CommandDeps): vscode.Disposable[] {
       await vscode.commands.executeCommand('workbench.action.openSettings', 'dbviewer');
     }
   });
+
+  // ------------------------------------------------------------ 备份
+
+  // 备份自带一套「选方式 → 选路径 → 进度 → 流式写盘」的流程，实现放在 commands/backup.ts，
+  // 这里只把它并进命令生命周期，保证随扩展一起释放
+  disposables.push(...registerBackupCommands(deps));
 
   return disposables;
 }

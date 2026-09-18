@@ -12,6 +12,7 @@
 import { DriverRegistry } from '../core/driverRegistry';
 import { registerBuiltinDrivers } from '../drivers';
 import {
+  BackupChunkRequest,
   CellUpdateRequest,
   CreateDatabaseOptions,
   CreateUserRequest,
@@ -143,6 +144,13 @@ async function handle(method: string, params: Record<string, unknown>): Promise<
         throw new DatabaseError(`驱动「${session.driverId}」不支持授权`, 'ENOT_MANAGE');
       }
       return session.driver.grantPrivileges(params.request as CreateUserRequest);
+    }
+    case 'backupChunks': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.backupChunks) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持备份`, 'ENOT_BACKUP');
+      }
+      return session.driver.backupChunks(params.request as BackupChunkRequest);
     }
     case 'execute': {
       const session = requireSession(String(params.connectionId));

@@ -9,8 +9,12 @@ import type { ConnectionOptions, FieldPacket, OkPacket, RowDataPacket } from 'my
 import * as mysql from 'mysql2/promise';
 
 import { MYSQL_DEFINITION } from './definitions';
+import { MysqlBackupSession } from './mysqlBackup';
+import { runBackupChunks } from './backupCore';
 import { buildResultSet, executeScript } from './support';
 import {
+  BackupChunk,
+  BackupChunkRequest,
   CellUpdateRequest,
   CellUpdateResult,
   ColumnNode,
@@ -42,6 +46,12 @@ export class MySqlDriver implements IDatabaseDriver {
   private defaultDatabase?: string;
   private queryTimeoutMs = 60_000;
   private readOnly = false;
+  /**
+   * 保留连接入参：备份需要另开一条连接，而密码只有这里拿得到。
+   * 存的是内存里的副本，不落盘；`disconnect()` 会连同它一起清掉。
+   */
+  private connectOptions?: DriverConnectOptions;
+  private backupSession?: MysqlBackupSession;
 
   async connect(options: DriverConnectOptions): Promise<void> {
     await this.disconnect();
@@ -75,9 +85,22 @@ export class MySqlDriver implements IDatabaseDriver {
     this.defaultDatabase = profile.database || undefined;
     this.queryTimeoutMs = queryTimeoutMs;
     this.readOnly = !!profile.readOnly;
+    this.connectOptions = options;
   }
 
   async disconnect(): Promise<void> {
+    // 备份连接先收：它可能正卡在一张大表的读取上，让主连接先走会留下孤儿连接
+    const backup = this.backupSession;
+    this.backupSession = undefined;
+    this.connectOptions = undefined;
+    if (backup) {
+      try {
+        await backup.close();
+      } catch {
+        /* 备份连接断开失败不影响主连接状态 */
+      }
+    }
+
     const conn = this.connection;
     this.connection = undefined;
     if (conn) {
@@ -280,6 +303,76 @@ export class MySqlDriver implements IDatabaseDriver {
       .map(([column, value]) => `${quoteMysqlIdent(column)} = ${toSqlLiteral(value, 'mysql')}`)
       .join(' AND ');
     return `UPDATE ${qualified} SET ${setClause} WHERE ${whereClause};`;
+  }
+
+  // ---------------------------------------------------------------- 备份
+
+  /**
+   * 产出备份文本片段。
+   *
+   * 走**独立连接**而不是复用当前连接：一条大表的 SELECT 会把 mysql2 单连接的请求队列
+   * 占满，期间树视图展开、查询执行全部排队等待，用户会以为插件卡死。
+   * 游标推进与 INSERT 拼装交给 `runBackupChunks`，这里只提供方言。
+   */
+  async backupChunks(request: BackupChunkRequest): Promise<BackupChunk> {
+    if (!this.connectOptions) {
+      throw new DatabaseError('MySQL 连接尚未建立', 'ENOT_CONNECTED');
+    }
+    const mode = MYSQL_DEFINITION.backupModes?.find((item) => item.id === request.modeId);
+    if (!mode) {
+      throw new DatabaseError(`未知的备份方式：${request.modeId}`, 'ENO_BACKUP_MODE');
+    }
+    if (!this.backupSession) {
+      this.backupSession = new MysqlBackupSession({
+        connect: () => this.createBackupConnection(),
+        release: async (connection) => {
+          try {
+            await connection.end();
+          } catch {
+            try {
+              connection.destroy();
+            } catch {
+              /* 已失效，忽略 */
+            }
+          }
+        },
+      });
+    }
+    return runBackupChunks(this.backupSession.dialect(), mode, request);
+  }
+
+  /**
+   * 建备份专用连接。
+   *
+   * 与主连接的唯一区别是 `dateStrings: true`：备份要的是「服务端原样给出的那个字符串」。
+   * 走 Date 对象会经历「字符串 → Date（按时区换算）→ 字符串（再换回来）」的往返，
+   * 时区配置稍有出入整列时间就会偏移。也不指定默认库，全部用全限定名访问，
+   * 跨库选表备份才不会因当前库不同而解析到别的表。
+   */
+  private async createBackupConnection(): Promise<mysql.Connection> {
+    const options = this.connectOptions;
+    if (!options) {
+      throw new DatabaseError('MySQL 连接尚未建立', 'ENOT_CONNECTED');
+    }
+    const profile = options.connection.profile;
+    try {
+      return await mysql.createConnection({
+        host: options.connection.host,
+        port: profile.port,
+        user: profile.user,
+        password: options.connection.password,
+        connectTimeout: options.connectTimeoutMs,
+        multipleStatements: false,
+        supportBigNumbers: true,
+        bigNumberStrings: true,
+        dateStrings: true,
+        charset: str(profile.options?.charset) ?? 'utf8mb4',
+        timezone: str(profile.options?.timezone) ?? 'local',
+        ssl: profile.ssl ? { rejectUnauthorized: false } : undefined,
+      });
+    } catch (err) {
+      throw normalizeMysqlError(err, options.connection.host, profile.port);
+    }
   }
 
   // ---------------------------------------------------------------- 内部实现

@@ -134,6 +134,8 @@ export interface DriverCapabilities {
   manageDatabase: boolean;
   /** 支持创建用户与授权。 */
   manageUser: boolean;
+  /** 支持把表 / 库导出成备份文件。 */
+  backup: boolean;
 }
 
 /** 驱动建立连接所需的完整入参。 */
@@ -192,6 +194,18 @@ export interface IDatabaseDriver {
   createUser?(request: CreateUserRequest): Promise<void>;
   /** 授权；`capabilities.manageUser` 为 true 时实现。 */
   grantPrivileges?(request: CreateUserRequest): Promise<void>;
+  /**
+   * 产出备份文本片段；`capabilities.backup` 为 true 时实现。
+   *
+   * 为什么是「分块 + 游标」而不是「一次性返回整个 dump」：备份动辄上百 MB，
+   * 一次性返回会同时撑爆驱动所在进程的内存与 IPC 通道（sidecar 模式下尤其明显）。
+   * 分块后扩展侧可以边收边写盘，内存占用与库大小无关。
+   *
+   * 另一个关键点：这里**不能复用 `execute()`**。执行链路会把 Date / Buffer / BigInt
+   * 洗成可 JSON 序列化的字符串（那是给结果面板用的），用它生成的 INSERT 会失真。
+   * 备份路径必须拿到原始值，再用 `toBackupLiteral` 按方言转义。
+   */
+  backupChunks?(request: BackupChunkRequest): Promise<BackupChunk>;
 }
 
 /**
@@ -214,6 +228,106 @@ export interface DriverDefinition {
    * 第三方驱动同样可以携带自己的图标——因此这是数据而不是渲染分支。
    */
   icon?: string;
+  /**
+   * 可用的备份方式。与 `icon` 同理：命令层只负责把这份列表渲染成选项，
+   * 不需要为每个数据库写分支，第三方驱动自带方式即可直接被支持。
+   */
+  backupModes?: BackupMode[];
+  /** 原生备份工具的参数模板；存在时才提供需外部命令的备份方式。 */
+  nativeBackup?: NativeBackupTool;
+}
+
+// ---------------------------------------------------------------- 备份
+
+/**
+ * 一种备份方式。
+ *
+ * 以数据形式声明，因此「这个数据库支持哪几种备份」对 UI 完全透明。
+ */
+export interface BackupMode {
+  /** 稳定标识，驱动内部据此分发（`sql` / `schema` / `data` / `native`）。 */
+  id: string;
+  label: string;
+  description?: string;
+  /** 导出文件的扩展名，不含点。 */
+  extension: string;
+  /** 是否包含结构（DDL）。 */
+  includesSchema: boolean;
+  /** 是否包含数据（INSERT）。 */
+  includesData: boolean;
+  /**
+   * 需要外部命令行工具时填写工具名（如 `mysqldump`）。
+   * 这类方式受 `dbviewer.allowExternalCommand` 管控，默认关闭。
+   */
+  cliName?: string;
+  /**
+   * 适用的入口范围。原生工具方式通常只能整库导出（两种调用形态的参数结构不同），
+   * 声明为 `database` 后就不会出现在表节点的右键菜单里。
+   */
+  scope?: 'database' | 'tables' | 'both';
+}
+
+/** 备份对象。视图只导出定义，不导出数据。 */
+export interface BackupTarget extends QueryTarget {
+  table: string;
+  kind: 'table' | 'view';
+}
+
+/** 分块备份请求：驱动每次产出一段可直接追加写盘的 SQL 文本。 */
+export interface BackupChunkRequest {
+  modeId: string;
+  tables: BackupTarget[];
+  /** 上次返回的续传游标；`undefined` 表示从头开始。 */
+  cursor?: string;
+  /** 单块最多读取的行数。 */
+  chunkRows: number;
+  timeoutMs: number;
+}
+
+/** 备份分块：一段 SQL 文本 + 下次调用所需的游标。 */
+export interface BackupChunk {
+  /** 本块产出的 SQL 文本。 */
+  text: string;
+  /** 续传游标；`null` 表示已全部完成。 */
+  nextCursor: string | null;
+  /** 块内跳过的对象与原因（权限不足等）：会写入文件注释并汇总给用户。 */
+  skipped?: BackupSkip[];
+  /** 进度信息。 */
+  progress?: BackupProgress;
+}
+
+export interface BackupProgress {
+  /** 当前正在导出的对象名。 */
+  table?: string;
+  /** 已导出的行数（累计）。 */
+  rows: number;
+  /** 已完成的对象数。 */
+  doneTables: number;
+  /** 对象总数。 */
+  totalTables: number;
+}
+
+export interface BackupSkip {
+  name: string;
+  reason: string;
+}
+
+/**
+ * 原生备份工具的参数模板。
+ *
+ * 参数以数组形式给出、由平台层原样传给 `spawn`（`shell: false`），
+ * 值永远不会被 shell 解释，命令层也不必为每种数据库写拼接分支。
+ */
+export interface NativeBackupTool {
+  /** 可执行文件名，如 `mysqldump`。 */
+  command: string;
+  /**
+   * 参数模板，支持 `${host}` `${port}` `${user}` `${database}` `${schema}` 占位符；
+   * 单独成项的 `${tables}` 会展开为零个或多个参数。
+   */
+  args: string[];
+  /** 密码环境变量名（`MYSQL_PWD` / `PGPASSWORD`）——密码绝不能出现在命令行参数里。 */
+  passwordEnv: string;
 }
 
 /** 创建数据库的选项。 */

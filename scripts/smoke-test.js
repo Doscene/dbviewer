@@ -473,6 +473,555 @@ function fakeDriver(options) {
     assert.strictEqual(sqlText.toSqlLiteral(evil, 'postgresql'), "'\\''; DROP TABLE t; --'");
   });
 
+  // ---------------------------------------------------------------- 备份
+
+  console.log('\n=== 9. 备份：字面量保真 ===');
+  const backupCore = require(path.join(outDir, 'core', 'backup.js'));
+  const backupChunkCore = require(path.join(outDir, 'drivers', 'backupCore.js'));
+  const externalTool = require(path.join(outDir, 'platform', 'externalTool.js'));
+  const definitions = require(path.join(outDir, 'drivers', 'definitions.js'));
+
+  check('MySQL 字面量：NULL / 布尔 / 数字 / 大整数', () => {
+    assert.strictEqual(sqlText.toBackupLiteral(null, 'mysql'), 'NULL');
+    assert.strictEqual(sqlText.toBackupLiteral(undefined, 'mysql'), 'NULL');
+    assert.strictEqual(sqlText.toBackupLiteral(true, 'mysql'), '1');
+    assert.strictEqual(sqlText.toBackupLiteral(false, 'mysql'), '0');
+    assert.strictEqual(sqlText.toBackupLiteral(42, 'mysql'), '42');
+    // 超出 Number 精度的大整数必须原样输出，不能被科学计数法改写
+    assert.strictEqual(sqlText.toBackupLiteral(9007199254740993n, 'mysql'), '9007199254740993');
+  });
+
+  check('PG 字面量：布尔用 TRUE / FALSE', () => {
+    assert.strictEqual(sqlText.toBackupLiteral(true, 'postgresql'), 'TRUE');
+    assert.strictEqual(sqlText.toBackupLiteral(false, 'postgresql'), 'FALSE');
+  });
+
+  check('字面量转义遵循方言（含注入防护）', () => {
+    const evil = "\\'; DROP TABLE t; --";
+    assert.strictEqual(sqlText.toBackupLiteral(evil, 'mysql'), "'\\\\''; DROP TABLE t; --'");
+    assert.strictEqual(sqlText.toBackupLiteral(evil, 'postgresql'), "'\\''; DROP TABLE t; --'");
+  });
+
+  check('二进制按十六进制写入，不被 toString 毁掉', () => {
+    const buffer = Buffer.from([0x48, 0x69]);
+    assert.strictEqual(sqlText.toBackupLiteral(buffer, 'mysql'), "X'4869'");
+    assert.strictEqual(sqlText.toBackupLiteral(buffer, 'postgresql'), "'\\x4869'::bytea");
+  });
+
+  check('日期渲染为本地时刻，保留毫秒', () => {
+    const date = new Date(2026, 8, 18, 14, 50, 3, 123);
+    assert.strictEqual(sqlText.toBackupLiteral(date, 'mysql'), "'2026-09-18 14:50:03.123'");
+  });
+
+  check('PG 数组用数组字面量，含逗号的元素不被拆列', () => {
+    assert.strictEqual(sqlText.toBackupLiteral([1, 2], 'postgresql'), '\'{"1","2"}\'');
+    assert.strictEqual(sqlText.pgArrayLiteral(['a,b', 'c"d']), '{"a,b","c\\"d"}');
+    assert.strictEqual(sqlText.pgArrayLiteral([null]), '{NULL}');
+    // 嵌套数组外层不能再加引号，否则 PG 会解析成一维
+    assert.strictEqual(sqlText.pgArrayLiteral([[1, 2], [3, 4]]), '{{"1","2"},{"3","4"}}');
+  });
+
+  check('对象按 JSON 文本写入', () => {
+    assert.strictEqual(sqlText.toBackupLiteral({ a: 1 }, 'mysql'), '\'{"a":1}\'');
+    assert.strictEqual(sqlText.toBackupLiteral([1, 2], 'mysql'), "'[1,2]'");
+  });
+
+  console.log('\n=== 10. 备份：方式元数据 ===');
+  check('内置驱动的备份方式声明自洽', () => {
+    for (const definition of definitions.BUILTIN_DEFINITIONS) {
+      assert.deepStrictEqual(
+        definitions.validateBackupMetadata(definition),
+        [],
+        `${definition.id} 的备份元数据有问题`,
+      );
+      assert.ok(definition.capabilities.backup, `${definition.id} 未声明支持备份`);
+      const ids = definition.backupModes.map((mode) => mode.id);
+      for (const id of ['sql', 'schema', 'data', 'native']) {
+        assert.ok(ids.includes(id), `${definition.id} 缺少备份方式 ${id}`);
+      }
+    }
+  });
+
+  check('validate 拦住「声明支持备份却没实现 backupChunks」', () => {
+    const problems = registry.validate({
+      id: 'half',
+      displayName: '半成品',
+      defaultPort: 1,
+      capabilities: {
+        columns: true,
+        schemas: false,
+        ddl: true,
+        multiStatement: true,
+        editable: true,
+        manageDatabase: true,
+        manageUser: true,
+        backup: true,
+      },
+      listColumns: () => [],
+      showCreateTable: () => undefined,
+      updateCell: () => undefined,
+    });
+    assert.ok(problems.some((p) => p.includes('backupChunks')), problems.join(' | '));
+  });
+
+  check('表节点入口不出现整库专用的备份方式', () => {
+    const modes = definitions.MYSQL_DEFINITION.backupModes;
+    const ids = (entry) => backupCore.filterBackupModesForScope(modes, entry).map((mode) => mode.id);
+    assert.deepStrictEqual(ids('tables'), ['sql', 'schema', 'data']);
+    assert.deepStrictEqual(ids('database'), ['sql', 'schema', 'data', 'native']);
+    // schema 是库的下一级，原生工具的「整库」语义套不上
+    assert.deepStrictEqual(ids('schema'), ['sql', 'schema', 'data']);
+  });
+
+  console.log('\n=== 11. 备份：范围收集 ===');
+  check('多选时按命名空间去重', () => {
+    const result = backupCore.collectBackupTargets([
+      { kind: 'table', profileId: 'p1', database: 'shop', table: 'orders', tableKind: 'table' },
+      { kind: 'table', profileId: 'p1', database: 'shop', table: 'orders', tableKind: 'table' },
+      { kind: 'table', profileId: 'p1', database: 'shop', table: 'v1', tableKind: 'view' },
+    ]);
+    assert.strictEqual(result.problem, undefined);
+    assert.strictEqual(result.profileId, 'p1');
+    assert.deepStrictEqual(result.targets.map((t) => t.table), ['orders', 'v1']);
+    assert.strictEqual(result.targets[1].kind, 'view');
+  });
+
+  check('不同 schema 下的同名表不会被误去重', () => {
+    const result = backupCore.collectBackupTargets([
+      { kind: 'table', profileId: 'p1', schema: 'a', table: 't' },
+      { kind: 'table', profileId: 'p1', schema: 'b', table: 't' },
+    ]);
+    assert.strictEqual(result.targets.length, 2);
+  });
+
+  check('跨连接多选被拒绝', () => {
+    const result = backupCore.collectBackupTargets([
+      { kind: 'table', profileId: 'p1', database: 'd', table: 't' },
+      { kind: 'table', profileId: 'p2', database: 'd', table: 'u' },
+    ]);
+    assert.strictEqual(result.targets.length, 0);
+    assert.ok(result.problem.includes('不同连接'), result.problem);
+  });
+
+  check('未选中表 / 只选了列节点都给出明确提示', () => {
+    assert.ok(backupCore.collectBackupTargets([]).problem.includes('没有选中'));
+    assert.ok(
+      backupCore.collectBackupTargets([{ kind: 'column', profileId: 'p1', table: 't' }]).problem.includes(
+        '没有选中',
+      ),
+    );
+  });
+
+  check('listTables 的结果可转成备份目标', () => {
+    const targets = backupCore.toBackupTargets(
+      { database: 'shop' },
+      [
+        { name: 'orders', schema: 'shop', kind: 'table' },
+        { name: 'v1', schema: 'shop', kind: 'view' },
+      ],
+    );
+    assert.deepStrictEqual(targets[0], { database: 'shop', schema: 'shop', table: 'orders', kind: 'table' });
+    assert.strictEqual(targets[1].kind, 'view');
+  });
+
+  console.log('\n=== 12. 备份：文件名与文件头 ===');
+  check('文件名过滤非法字符并附时间戳', () => {
+    const name = backupCore.buildBackupFileName({
+      base: 'a/b:c*d?e"f<g>h|i',
+      mode: { extension: 'sql' },
+      now: new Date(2026, 8, 18, 14, 50, 3),
+    });
+    assert.strictEqual(name, 'a_b_c_d_e_f_g_h_i-20260918-145003.sql');
+  });
+
+  check('不会拼出隐藏文件，空名有兜底', () => {
+    assert.strictEqual(backupCore.sanitizeFileName('...hidden'), 'hidden');
+    assert.strictEqual(backupCore.sanitizeFileName('   '), 'backup');
+  });
+
+  check('文件头写清范围、方式、生成器与注意事项', () => {
+    const header = backupCore.buildBackupHeader({
+      connectionName: '本地',
+      driverName: 'MySQL / MariaDB',
+      scope: '数据库 shop',
+      modeLabel: '完整 SQL（结构 + 数据）',
+      tableCount: 3,
+      viewCount: 1,
+      generator: 'DBViewer 内置导出（逐表 SELECT）',
+      notes: ['不含 DROP 语句'],
+      now: new Date(2026, 8, 18, 14, 50, 3),
+    });
+    for (const keyword of [
+      '数据库 shop',
+      '完整 SQL',
+      '2026-09-18 14:50:03',
+      '3 张表 / 1 个视图',
+      '不含 DROP 语句',
+    ]) {
+      assert.ok(header.includes(keyword), `文件头缺少「${keyword}」`);
+    }
+    assert.ok(header.startsWith('--'), '文件头必须是注释，直接执行才不会报错');
+  });
+
+  console.log('\n=== 13. 备份：原生工具参数 ===');
+  check('参数模板逐个取值，不与其他参数粘连', () => {
+    const args = externalTool.expandNativeArgs(
+      ['--host=${host}', '--port=${port}', '--dbname=${database}', '--tables=${tables}'],
+      { host: '10.0.0.1', port: 3306, user: 'root', database: 'shop', tables: [] },
+    );
+    assert.deepStrictEqual(args, ['--host=10.0.0.1', '--port=3306', '--dbname=shop', '--tables=']);
+  });
+
+  check('单独成项的 ${tables} 展开为多个独立参数', () => {
+    const args = externalTool.expandNativeArgs(['${database}', '${tables}'], {
+      host: 'h',
+      port: 1,
+      user: 'u',
+      database: 'shop',
+      tables: ['a', 'b'],
+    });
+    assert.deepStrictEqual(args, ['shop', 'a', 'b']);
+  });
+
+  await checkAsync('参数含空字节时拒绝启动进程', async () => {
+    await assert.rejects(
+      externalTool.runExternalTool({ command: 'dbviewer-no-such-tool', args: ['a\u0000b'], timeoutMs: 1000 }),
+      /空字节/,
+    );
+  });
+
+  await checkAsync('命令不存在时提示可操作的原因', async () => {
+    await assert.rejects(
+      externalTool.runExternalTool({
+        command: 'dbviewer-definitely-missing-tool',
+        args: [],
+        timeoutMs: 5000,
+      }),
+      /未找到命令/,
+    );
+  });
+
+  console.log('\n=== 14. 备份：分块状态机 ===');
+  /**
+   * 造一个内存方言：表结构与数据都由测试给出，全程不碰数据库。
+   * 这样状态机的分支（多表切换、分页、只导结构 / 只导数据、单表失败）都能被压到。
+   */
+  function fakeDialect(spec, counters) {
+    const reads = [];
+    return {
+      reads,
+      dialect: {
+        generator: '测试',
+        notes: [],
+        prologue: 'SET NAMES utf8mb4;',
+        qualify: (target) => `\`${target.database}\`.\`${target.table}\``,
+        quoteIdent: (name) => `\`${name}\``,
+        literal: (value) => sqlText.toBackupLiteral(value, 'mysql'),
+        open: async () => {
+          counters.opened += 1;
+        },
+        close: async () => {
+          counters.closed += 1;
+        },
+        tableMeta: async (target) => spec[target.table].meta,
+        createSql: async (target) => spec[target.table].ddl,
+        readRows: async (params) => {
+          const entry = spec[params.target.table];
+          if (entry.failRead) {
+            throw new Error(entry.failRead);
+          }
+          reads.push({ table: params.target.table, offset: params.offset, afterKey: params.afterKey });
+          const rows = entry.rows;
+          if (params.keyColumn) {
+            const start =
+              params.afterKey === undefined
+                ? 0
+                : rows.findIndex((row) => String(row[params.keyColumn]) === String(params.afterKey)) + 1;
+            return rows.slice(start, start + params.limit);
+          }
+          return rows.slice(params.offset, params.offset + params.limit);
+        },
+      },
+    };
+  }
+
+  const TABLES = [
+    { database: 'shop', table: 'users', kind: 'table' },
+    { database: 'shop', table: 'orders', kind: 'table' },
+  ];
+  const SQL_MODE = { id: 'sql', label: '完整', extension: 'sql', includesSchema: true, includesData: true };
+
+  await checkAsync('分块导出：结构 + 数据齐全，游标最终收敛', async () => {
+    const counters = { opened: 0, closed: 0 };
+    const fake = fakeDialect(
+      {
+        users: {
+          meta: { columns: ['id', 'name'], keyColumn: 'id' },
+          ddl: 'CREATE TABLE `users` (`id` int);',
+          rows: [{ id: 1, name: 'a' }, { id: 2, name: "b'c" }, { id: 3, name: null }],
+        },
+        orders: {
+          meta: { columns: ['id'], keyColumn: 'id' },
+          ddl: 'CREATE TABLE `orders` (`id` int);',
+          rows: [{ id: 10 }],
+        },
+      },
+      counters,
+    );
+
+    let cursor;
+    let text = '';
+    let rounds = 0;
+    do {
+      const chunk = await backupChunkCore.runBackupChunks(fake.dialect, SQL_MODE, {
+        modeId: 'sql',
+        tables: TABLES,
+        cursor,
+        chunkRows: 2,
+        timeoutMs: 1000,
+      });
+      text += chunk.text;
+      cursor = chunk.nextCursor ?? undefined;
+      rounds += 1;
+      assert.ok(rounds < 20, '游标没有推进，可能死循环');
+    } while (cursor);
+
+    assert.ok(text.includes('SET NAMES utf8mb4;'), '缺少序言');
+    assert.ok(text.includes('CREATE TABLE `users`'));
+    assert.ok(text.includes('CREATE TABLE `orders`'));
+    assert.ok(text.includes('INSERT INTO `shop`.`users` (`id`, `name`) VALUES'));
+    assert.ok(text.includes("(2, 'b''c')"), text);
+    assert.ok(text.includes('(3, NULL)'));
+    assert.ok(text.includes('INSERT INTO `shop`.`orders` (`id`) VALUES'));
+    assert.strictEqual(counters.opened, 1, '备份连接应只开一次');
+    assert.strictEqual(counters.closed, 1, '结束时应释放备份连接');
+  });
+
+  await checkAsync('keyset 分页：后续块带上上一行主键，而不是 OFFSET', async () => {
+    const counters = { opened: 0, closed: 0 };
+    const fake = fakeDialect(
+      {
+        users: {
+          meta: { columns: ['id'], keyColumn: 'id' },
+          ddl: 'CREATE TABLE `users` (`id` int);',
+          rows: [{ id: 1 }, { id: 2 }, { id: 3 }],
+        },
+      },
+      counters,
+    );
+    const tables = [{ database: 'shop', table: 'users', kind: 'table' }];
+    let cursor;
+    do {
+      const chunk = await backupChunkCore.runBackupChunks(fake.dialect, SQL_MODE, {
+        modeId: 'sql',
+        tables,
+        cursor,
+        chunkRows: 2,
+        timeoutMs: 1000,
+      });
+      cursor = chunk.nextCursor ?? undefined;
+    } while (cursor);
+
+    assert.strictEqual(fake.reads.length, 2, `读取次数应为 2，实际 ${fake.reads.length}`);
+    assert.strictEqual(fake.reads[0].afterKey, undefined);
+    assert.strictEqual(String(fake.reads[1].afterKey), '2', '第二块应从上一次的最后一行之后继续');
+    assert.deepStrictEqual(fake.reads.map((r) => r.offset), [0, 0], '有主键时不应退回 OFFSET');
+  });
+
+  await checkAsync('无单列主键时退回 OFFSET 分页', async () => {
+    const counters = { opened: 0, closed: 0 };
+    const fake = fakeDialect(
+      {
+        log: {
+          meta: { columns: ['msg'] },
+          ddl: 'CREATE TABLE `log` (`msg` text);',
+          rows: [{ msg: 'a' }, { msg: 'b' }, { msg: 'c' }],
+        },
+      },
+      counters,
+    );
+    let cursor;
+    do {
+      const chunk = await backupChunkCore.runBackupChunks(fake.dialect, SQL_MODE, {
+        modeId: 'sql',
+        tables: [{ database: 'shop', table: 'log', kind: 'table' }],
+        cursor,
+        chunkRows: 2,
+        timeoutMs: 1000,
+      });
+      cursor = chunk.nextCursor ?? undefined;
+    } while (cursor);
+    assert.deepStrictEqual(fake.reads.map((r) => r.offset), [0, 2]);
+  });
+
+  await checkAsync('仅结构模式不读数据，仅数据模式不出建表语句', async () => {
+    const counters = { opened: 0, closed: 0 };
+    const spec = {
+      users: {
+        meta: { columns: ['id'], keyColumn: 'id' },
+        ddl: 'CREATE TABLE `users` (`id` int);',
+        rows: [{ id: 1 }],
+      },
+    };
+    const tables = [{ database: 'shop', table: 'users', kind: 'table' }];
+
+    const schemaOnly = fakeDialect(spec, counters);
+    let chunk = await backupChunkCore.runBackupChunks(
+      schemaOnly.dialect,
+      { id: 'schema', label: '仅结构', extension: 'sql', includesSchema: true, includesData: false },
+      { modeId: 'schema', tables, cursor: undefined, chunkRows: 10, timeoutMs: 1000 },
+    );
+    assert.strictEqual(chunk.nextCursor, null);
+    assert.ok(chunk.text.includes('CREATE TABLE'));
+    assert.ok(!chunk.text.includes('INSERT INTO'), '仅结构模式不应产生 INSERT');
+    assert.strictEqual(schemaOnly.reads.length, 0);
+
+    const dataOnly = fakeDialect(spec, counters);
+    chunk = await backupChunkCore.runBackupChunks(
+      dataOnly.dialect,
+      { id: 'data', label: '仅数据', extension: 'sql', includesSchema: false, includesData: true },
+      { modeId: 'data', tables, cursor: undefined, chunkRows: 10, timeoutMs: 1000 },
+    );
+    assert.ok(!chunk.text.includes('CREATE TABLE'), '仅数据模式不应出建表语句');
+    assert.ok(chunk.text.includes('INSERT INTO'));
+  });
+
+  await checkAsync('视图只导定义，不导数据', async () => {
+    const counters = { opened: 0, closed: 0 };
+    const fake = fakeDialect(
+      {
+        v1: {
+          meta: { columns: ['id'], keyColumn: undefined },
+          ddl: 'CREATE VIEW `v1` AS SELECT 1;',
+          rows: [{ id: 1 }],
+        },
+      },
+      counters,
+    );
+    const chunk = await backupChunkCore.runBackupChunks(fake.dialect, SQL_MODE, {
+      modeId: 'sql',
+      tables: [{ database: 'shop', table: 'v1', kind: 'view' }],
+      cursor: undefined,
+      chunkRows: 10,
+      timeoutMs: 1000,
+    });
+    assert.ok(chunk.text.includes('CREATE VIEW'), '视图定义应写入');
+    assert.ok(!chunk.text.includes('INSERT INTO'), '视图不应产生 INSERT');
+    assert.strictEqual(fake.reads.length, 0);
+  });
+
+  await checkAsync('单张表失败只跳过它，其余照常导出', async () => {
+    const counters = { opened: 0, closed: 0 };
+    const fake = fakeDialect(
+      {
+        users: {
+          meta: { columns: ['id'], keyColumn: 'id' },
+          ddl: 'CREATE TABLE `users` (`id` int);',
+          rows: [],
+          failRead: 'SELECT command denied to user',
+        },
+        orders: {
+          meta: { columns: ['id'], keyColumn: 'id' },
+          ddl: 'CREATE TABLE `orders` (`id` int);',
+          rows: [{ id: 10 }],
+        },
+      },
+      counters,
+    );
+    let cursor;
+    let text = '';
+    const skipped = [];
+    do {
+      const chunk = await backupChunkCore.runBackupChunks(fake.dialect, SQL_MODE, {
+        modeId: 'sql',
+        tables: TABLES,
+        cursor,
+        chunkRows: 5,
+        timeoutMs: 1000,
+      });
+      text += chunk.text;
+      skipped.push(...(chunk.skipped ?? []));
+      cursor = chunk.nextCursor ?? undefined;
+    } while (cursor);
+
+    assert.strictEqual(skipped.length, 1);
+    assert.strictEqual(skipped[0].name, 'shop.users');
+    assert.ok(skipped[0].reason.includes('denied'));
+    assert.ok(text.includes('INSERT INTO `shop`.`orders`'), '另一张表应继续导出');
+  });
+
+  console.log('\n=== 15. 备份：编排与取消 ===');
+  await checkAsync('分块写入 sink，进度与统计累计正确', async () => {
+    const sink = new backupCore.MemorySink();
+    const progress = [];
+    const total = { tables: 2, rows: 0, bytes: 0, skipped: [], cancelled: false };
+    const source = {
+      calls: 0,
+      async backupChunks(request) {
+        this.calls += 1;
+        const done = this.calls >= 2;
+        return {
+          text: `-- chunk ${this.calls}\n`,
+          nextCursor: done ? null : 'cursor-1',
+          progress: { rows: this.calls * 10, doneTables: this.calls, totalTables: 2 },
+        };
+      },
+    };
+    const result = await backupCore.runBackup({
+      source,
+      modeId: 'sql',
+      tables: TABLES,
+      sink,
+      timeoutMs: 1000,
+      onProgress: (info) => progress.push(info),
+    });
+    assert.strictEqual(result.bytes, `-- chunk 1\n-- chunk 2\n`.length);
+    assert.strictEqual(result.rows, 20);
+    assert.strictEqual(progress.length, 2);
+    assert.strictEqual(sink.isClosed, true);
+    assert.strictEqual(sink.isAborted, false);
+    assert.strictEqual(sink.text, `-- chunk 1\n-- chunk 2\n`);
+    assert.deepStrictEqual(total.skipped, []);
+  });
+
+  await checkAsync('取消时走 abort 而不是 close，避免留下半成品', async () => {
+    const sink = new backupCore.MemorySink();
+    const token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) };
+    const source = {
+      async backupChunks() {
+        // 模拟用户在第一块之后按了取消
+        token.isCancellationRequested = true;
+        return { text: '-- partial\n', nextCursor: 'more', progress: { rows: 1, doneTables: 1, totalTables: 2 } };
+      },
+    };
+    const result = await backupCore.runBackup({
+      source,
+      modeId: 'sql',
+      tables: TABLES,
+      sink,
+      timeoutMs: 1000,
+      token,
+    });
+    assert.strictEqual(result.cancelled, true);
+    assert.strictEqual(sink.isAborted, true);
+    assert.strictEqual(sink.text, '', '中止后不应留下任何内容');
+  });
+
+  await checkAsync('驱动抛错时中止并向上抛出', async () => {
+    const sink = new backupCore.MemorySink();
+    const source = {
+      async backupChunks() {
+        throw new Error('连接被服务端中断');
+      },
+    };
+    await assert.rejects(
+      backupCore.runBackup({ source, modeId: 'sql', tables: TABLES, sink, timeoutMs: 1000 }),
+      /服务端中断/,
+    );
+    // runBackup 自身不吞异常，清理由命令层负责；这里只要求错误原样抛出
+    assert.strictEqual(sink.isClosed, false);
+  });
+
   console.log(`\n=========================================`);
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项`);
   if (failures.length) {

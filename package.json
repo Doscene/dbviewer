@@ -2,7 +2,7 @@
   "name": "dbviewer-dsc",
   "displayName": "DBViewer",
   "description": "跨平台数据库客户端 (Windows / WSL 双环境)：连接管理、SQL 执行、结果浏览。内置 MySQL、PostgreSQL 驱动，支持驱动插件化扩展。",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "doscene-cloud",
   "license": "MIT",
   "repository": {
@@ -205,6 +205,18 @@
         "title": "诊断运行环境（Windows / WSL）",
         "category": "DBViewer",
         "icon": "$(info)"
+      },
+      {
+        "command": "dbviewer.backupTables",
+        "title": "备份数据表…",
+        "category": "DBViewer",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "dbviewer.backupDatabase",
+        "title": "备份数据库…",
+        "category": "DBViewer",
+        "icon": "$(cloud-download)"
       }
     ],
     "menus": {
@@ -305,6 +317,26 @@
           "command": "dbviewer.createUser",
           "when": "view == dbviewer.connections && viewItem == dbviewer.connectionConnected",
           "group": "5_manage@4"
+        },
+        {
+          "command": "dbviewer.backupTables",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.(table|view)/",
+          "group": "6_backup@1"
+        },
+        {
+          "command": "dbviewer.backupDatabase",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.database",
+          "group": "6_backup@1"
+        },
+        {
+          "command": "dbviewer.backupDatabase",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.schema",
+          "group": "6_backup@1"
+        },
+        {
+          "command": "dbviewer.backupDatabase",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.connectionConnected",
+          "group": "6_backup@2"
         }
       ],
       "editor/title": [
@@ -466,7 +498,15 @@
         "dbviewer.allowExternalCommand": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "是否允许调用外部命令辅助探测网络环境（`wsl.exe hostname -I`、`wslinfo`）。默认关闭——受管控的机器上安全策略常拦截 `wsl.exe`，开启后可能产生告警或失败。关闭时 `__wsl_host__` 按 `127.0.0.1` 处理（依赖 WSL2 默认的 localhost 转发）。"
+          "markdownDescription": "是否允许调用外部命令（探测网络环境的 `wsl.exe hostname -I`、`wslinfo`，以及备份时的 `mysqldump` / `pg_dump`）。默认关闭——受管控的机器上安全策略常拦截这类调用，开启后可能产生告警或失败。关闭时 `__wsl_host__` 按 `127.0.0.1` 处理（依赖 WSL2 默认的 localhost 转发），备份只提供内置导出方式。"
+        },
+        "dbviewer.backupToolPaths": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "原生备份工具的可执行文件路径，键为命令名、值为绝对路径，例如 `{ \"mysqldump\": \"C:/Program Files/MySQL/MySQL Server 8.0/bin/mysqldump.exe\" }`。留空则按 `PATH` 查找；仅在使用原生备份方式时读取，且需开启 `dbviewer.allowExternalCommand`。",
+          "additionalProperties": {
+            "type": "string"
+          }
         },
         "dbviewer.hostAliases": {
           "type": "object",

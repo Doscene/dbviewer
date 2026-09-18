@@ -11,6 +11,8 @@
 
 import { ProcessChannel } from '../platform/processChannel';
 import {
+  BackupChunk,
+  BackupChunkRequest,
   CellUpdateRequest,
   CellUpdateResult,
   ColumnNode,
@@ -171,6 +173,19 @@ export class SidecarDriverProxy implements IDatabaseDriver {
       throw new DatabaseError(`驱动「${this.id}」不支持授权`, 'ENOT_MANAGE');
     }
     await this.call<void>('grantPrivileges', { request });
+  }
+
+  /**
+   * 备份分块转发到子进程。
+   *
+   * 传的是「模式 id + 游标」而不是拼好的 SQL：语句生成始终留在驱动内，
+   * 两种模式产出的备份文件因此逐字节一致，不会出现「换了个模式备份内容就变了」。
+   */
+  async backupChunks(request: BackupChunkRequest): Promise<BackupChunk> {
+    if (!this.capabilities.backup) {
+      throw new DatabaseError(`驱动「${this.id}」不支持备份`, 'ENOT_BACKUP');
+    }
+    return this.call<BackupChunk>('backupChunks', { request });
   }
 
   previewSql(target: QueryTarget & { table: string }, limit: number): string {

@@ -2,6 +2,29 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [0.6.0] - 2026-09-18
+
+### 新增
+
+- **备份选中的数据表**：连接树支持多选（`canSelectMany`），在表 / 视图节点上右键「备份数据表…」即把选中对象导出到**同一个** SQL 文件。跨连接的选中项直接拒绝而不是拆成多个文件，同名表来自不同库 / schema 时按命名空间去重。
+- **备份整个数据库**：数据库节点（MySQL）/ schema 节点（PostgreSQL）/ 已连接的连接节点右键「备份数据库…」。整库入口先读一次对象列表，再走同一套备份流程。
+- **多种备份方式由驱动声明**：新增 `DriverDefinition.backupModes[]`，MySQL 与 PostgreSQL 各提供四种 —— 完整 SQL（结构 + 数据）、仅表结构、仅数据、原生 `mysqldump` / `pg_dump`。弹出列表按入口范围自动过滤（原生工具声明 `scope: 'database'`，因此不出现在表节点菜单里）；选中原生方式而 `dbviewer.allowExternalCommand` 未开启时，提示后可直接退回内置方式，不必重跑命令。
+- **分块流式导出**：驱动按「SQL 文本片段 + 游标」产出（新增 `IDatabaseDriver.backupChunks()`），命令层边收边写盘，内存占用与库大小无关，进度逐表刷新，随时可取消。取消时删除半成品文件而不是保留截断结果 —— 一个被截断的 `.sql` 看起来是完整的，导入到一半才会报语法错误。
+- **数据保真**：新增 `sqlText.toBackupLiteral()`（区别于 `toSqlLiteral`）—— 时间按服务端原样字符串写出、二进制按十六进制、PostgreSQL 数组按数组字面量，避免经 `execute()` 的 JSON 清洗失真。备份连接独立于交互连接：MySQL 用 `dateStrings: true` 且不指定默认库，PostgreSQL 用原样类型解析器且关闭语句超时。
+- **原生工具调用**：新增 `platform/externalTool.ts`，`spawn` + `shell: false` + 参数数组（值不会被 shell 解释），密码只走环境变量（`MYSQL_PWD` / `PGPASSWORD`），绝不进命令行；错误按 ENOENT / EACCES / 超时 / 非 0 退出分类给出可操作的提示。工具路径可用 `dbviewer.backupToolPaths` 指定，缺省走 `PATH`。
+- 单表读取失败只跳过该表并在**文件尾部**写明跳过原因；生成的 `.sql` 文件头记录连接、范围、方式、对象数量与生成时间。
+
+### 变更
+
+- `package.json` 注册 `dbviewer.backupTables` / `dbviewer.backupDatabase` 两条命令与对应右键菜单（`6_backup` 分组），新增 `dbviewer.backupToolPaths` 配置项；`dbviewer.allowExternalCommand` 的说明补充了备份场景。
+- 驱动元数据新增 `backupModes` / `nativeBackup`，能力位新增 `capabilities.backup`；`DriverRegistry.validate()` 会拦住「声明支持备份却没实现 `backupChunks()`」的驱动。
+- 版本号提升至 `0.6.0`（**尚未打包发布**，0.5.0 仍在 Marketplace 验证队列中）。
+
+### 测试
+
+- 冒烟测试从 52 项扩展到 **83 项**：新增字面量保真（大整数、二进制、日期、PG 数组）、备份方式元数据与范围过滤、多选目标收集（去重 / 跨连接拒绝）、文件名与文件头、原生工具参数展开（逐项替换、空字节拦截、ENOENT 提示）、分块状态机（结构 + 数据、keyset 与 OFFSET 分页、仅结构 / 仅数据、视图、单表失败跳过）、编排与取消（取消走 abort 而非 close）。
+- 激活测试从 64 项扩展到 **66 项**：备份两条命令纳入无参调用检查；mock 的 `withProgress` 补上真实的取消令牌参数并新增 `CancellationTokenSource` —— 此前 mock 只传进度对象，回调里访问 `token` 会抛 TypeError 并被自身的 try/catch 吞掉，测试反而「通过」。
+
 ## [0.5.0] - 2026-09-17
 
 ### 新增

@@ -1,276 +1,262 @@
 # DBViewer
 
-VS Code 数据库客户端插件。**同时兼容 Windows 原生与 WSL 子系统两种运行场景**，内置 MySQL、PostgreSQL 驱动，驱动层可插拔扩展。
+**在 VS Code 里连数据库 —— 包括 WSL 连 Windows、Windows 连 WSL。**
 
----
+连接管理、SQL 编辑执行、结果浏览编辑导出、表与账号管理，全部在编辑器内完成。
+内置 MySQL 与 PostgreSQL 驱动，可直接使用；架构上支持新增数据库类型而不改动现有代码。
 
-## 1. 为什么单独处理 Windows / WSL
+<!-- 截图位：把截图放进仓库后取消注释（市场页只认绝对地址）
+![结果面板与 SQL Shell](https://raw.githubusercontent.com/Doscene/dbviewer/main/docs/screenshot.png)
+-->
 
-WSL2 默认使用 NAT 网络：WSL 发行版与 Windows 宿主各有独立 IP，两侧的 `localhost` 指向完全不同的实体。这导致同一个连接配置在「本地 Windows 打开」与「Remote-WSL 打开」时表现不一致，最典型的故障是 `ECONNREFUSED`。
+## 亮点
 
-本插件用**主机别名**消除这类配置漂移：
+- **跨 Windows / WSL 直连** —— 不用再手工查 WSL 的 IP，也不用改连接配置在两套环境间来回切。
+- **连接配置是单页表单** —— 所有字段一屏可见可改，切换数据库类型自动更新默认端口与专属参数，保存前可先测连接。
+- **查询执行顺手** —— `.sql` 文件按快捷键即跑，多语句自动拆分、逐条出结果、出错能定位到具体某条。
+- **结果不只是看** —— 可排序、可改 SQL 重跑、可双击改单元格（改完确认才落库）、可导出 CSV / Excel / JSON / JSONL。
+- **能备份** —— 多选数据表一次性导出，或右键整库 / 整个 schema 备份；走内置纯 SQL 导出，也可借力本机的 `mysqldump` / `pg_dump`。
+- **写操作有护栏** —— 危险语句执行前二次确认；只读连接从驱动层直接拒绝写操作。
+- **凭据不进配置文件** —— 密码存系统凭据存储（Windows DPAPI / WSL libsecret）。
 
-| 别名 | 含义 | WSL 内解析为 | Windows 上解析为 |
+## 安装
+
+从扩展市场安装（推荐）：在 VS Code 扩展面板搜索 **DBViewer**，或在命令面板执行
+
+```
+ext install doscene-cloud.dbviewer-dsc
+```
+
+命令行安装：
+
+```bash
+code --install-extension doscene-cloud.dbviewer-dsc
+```
+
+离线安装：下载 `.vsix` 后执行 `code --install-extension dbviewer-x.y.z.vsix`。
+
+## 三步上手
+
+1. 左侧活动栏点击 **DBViewer** 图标 → 点标题栏的 `+`；
+2. 填写连接表单，点「测试连接」确认能通，再点「保存并连接」；
+3. 连上后即可：**展开节点**浏览库 / 表 / 列，**右键表**查看数据或建表语句，**右键连接**打开 SQL Shell 或新建查询。
+
+> 已保存的连接节点**点一下就连接**，不必先右键。
+
+## 跨 Windows / WSL 连接
+
+WSL2 默认用 NAT 网络：WSL 与 Windows 各有独立 IP，两侧的 `localhost` 指向完全不同的实体。同一个连接配置在「Windows 打开」和「Remote-WSL 打开」时表现不一致，最常见的现象就是 `ECONNREFUSED`。
+
+DBViewer 用**主机别名**抹平这件事 —— 主机栏填别名，插件按当前运行环境自动解析成真实地址：
+
+| 别名 | 含义 | WSL 中解析为 | Windows 中解析为 |
 |---|---|---|---|
-| `__windows_host__` | 数据库部署在 Windows | 默认网关（`/proc/net/route`） | `127.0.0.1` |
-| `__wsl_host__` | 数据库部署在 WSL | `127.0.0.1` | `127.0.0.1`（依赖 WSL2 localhost 转发） |
+| `__windows_host__` | 数据库装在 Windows 上 | 默认网关 | `127.0.0.1` |
+| `__wsl_host__` | 数据库装在 WSL 里 | `127.0.0.1` | `127.0.0.1`（走 WSL2 localhost 转发） |
 | `__localhost__` | 强制本机回环 | `127.0.0.1` | `127.0.0.1` |
 
-镜像网络模式（WSL 2.0+，`.wslconfig` 中 `networkingMode=mirrored`）下，两侧的 `127.0.0.1` 双向直通，别名同样适用。
+**你该填哪个：**
 
-### 三种典型场景
-
-| 场景 | 插件运行位置 | 建议填写的主机 |
-|---|---|---|
-| Windows 原生打开，数据库装在 Windows | Windows 扩展宿主 | `127.0.0.1` |
-| Remote-WSL 打开，数据库装在 WSL | WSL 扩展宿主 | `127.0.0.1` |
-| Windows 打开，数据库装在 WSL | Windows 扩展宿主 | `__wsl_host__` |
-| WSL 打开，数据库装在 Windows | WSL 扩展宿主 | `__windows_host__` |
-
-> 扩展声明了 `extensionKind: ["workspace", "ui"]`：Remote-WSL 场景下优先运行在 WSL 侧，驱动直连数据库，不跨网络。
-
-### 设计取舍：默认不执行外部命令
-
-早期实现通过 `wsl.exe hostname -I` 获取 WSL 地址，但在受管控的机器上安全策略会拦截 `wsl.exe`。现在默认路径**完全不依赖子进程**：
-
-- WSL → Windows：读取 `/proc/net/route`（零副作用）；
-- Windows → WSL：返回 `127.0.0.1`，依赖 WSL2 自带的 localhost 转发；
-- 仅当显式开启 `dbviewer.allowExternalCommand` 时才尝试调用 `wsl.exe` / `wslinfo`。
-
----
-
-## 2. 功能
-
-- **连接表单**：单页 Webview 表单，一次填完全部字段。数据库类型、主机、端口、用户名、密码、默认数据库、分组、SSL、只读模式、驱动私有参数都在同一屏；切换数据库类型会自动更新默认端口、驱动说明与专属参数项。表单内可**先测试连接再保存**，测试成功后「默认数据库」会填充候选列表。主机输入框实时回显别名解析结果，`localhost` 这类跨环境陷阱会即时给出警告。
-- **连接管理**：分组树视图、增删改查、复制连接、只读模式；密码存入系统凭据存储（Windows DPAPI / WSL libsecret），不落配置文件。连接节点使用对应数据库的官方标志（MySQL 海豚 / PostgreSQL 大象），**未连接的节点点一下即连接**。
-- **元数据浏览**：按驱动能力自适应层级。MySQL 为 `连接 → 数据库 → 表 → 列`；PostgreSQL 为 `连接 → schema → 表/视图 → 列`。
-- **查询执行**：任意 SQL 文档（`.sql`）内 `Ctrl+Alt+E` 执行全文、`Ctrl+Alt+Shift+E` 执行选中；编辑器标题栏常驻 ▶ 执行全部 / 执行选中 / 切换连接三个按钮；多语句自动拆分逐条执行并分别展示结果集。
-- **结果面板**：顶部是**本次实际执行的 SQL**（含自动追加的 `LIMIT`），可直接改、按「▶ 执行」或 `Ctrl+Enter` 重跑，也可一键还原；下方分页浏览、点击列头排序、单击单元格复制、复制当前页为 TSV。
-- **结果表格编辑**：双击单元格就地改值 → 改动以橙色高亮挂起并计数 → 点「应用修改 (N)」才真正落库，旁边「放弃」整体撤销。扩展侧依据**主键**逐条生成 `UPDATE`，实际下发的 SQL 回显在面板上，单格失败不影响其余。无主键、主键不在结果列中、驱动未声明 `editable` 或连接为只读时，编辑入口自动关闭。
-- **结果导出**：CSV（带 BOM，Excel 不乱码）、Excel（真 `.xlsx`，无第三方依赖，冻结表头 + 自动筛选 + 斑马纹 + 自适应列宽）、JSON、JSONL（每行一个对象，便于流式导入）。
-- **表操作**：查看前 N 行、查看建表语句（PG 由系统目录拼装近似 DDL）、生成查询语句、复制名称。
-- **写操作保护**：`INSERT / UPDATE / DELETE / DROP / TRUNCATE / ALTER` 等执行前二次确认；只读连接直接拦截。
-- **环境诊断**：`DBViewer: 诊断运行环境（Windows / WSL）` 输出完整的网络与驱动状态，并给出针对性排查建议。
-
-> 为什么不用 VS Code 原生的逐项弹窗（`showInputBox` 串行询问）？因为那种方式看不到已填内容、无法跳步回改、改一个字段要重走全流程，且每次弹窗都会打断输入焦点。表单能一次性呈现全部字段与上下文提示，符合「配置连接」这件事的实际使用方式。
-
-### 结果表格编辑的安全边界
-
-改一行数据比查一行数据的破坏力大得多，因此编辑能力是**推导出来的，不是默认给的**：
-
-| 条件 | 结果 |
+| 你的情况 | 主机填 |
 |---|---|
-| 驱动 `capabilities.editable !== true` | 不可编辑 |
-| `listColumns` 查不到主键 | 不可编辑（没有可靠的 `WHERE`） |
-| 主键列未全部出现在结果列中 | 不可编辑（可能会改错行） |
-| 本次执行是多语句 / 多结果集 | 不可编辑（第二组结果可能来自另一张表） |
-| 语句不是单表 `SELECT`（CTE、UNION、`FROM (子查询)`） | 不可编辑 |
-| 连接勾选了「只读模式」 | 不可编辑，驱动层直接拒绝写操作 |
+| 在 Windows 打开 VS Code，数据库也在 Windows | `127.0.0.1` |
+| 用 Remote-WSL 打开，数据库也装在 WSL | `127.0.0.1` |
+| 在 Windows 打开 VS Code，数据库装在 WSL | `__wsl_host__` |
+| 用 Remote-WSL 打开，数据库装在 Windows | `__windows_host__` |
 
-生成的 `UPDATE` 由驱动完成标识符引用与字面量转义（MySQL 用反引号 + `\` 转义，PG 用双引号 + 双写单引号），通用层不参与拼装 SQL，避免跨方言错误与注入。
+主机输入框会**实时回显解析结果**，填 `localhost` 这类跨环境陷阱时会即时警告，别名可点击直接填入。也可在设置里用 `dbviewer.hostAliases` 自定义别名（例如 `{ "__prod__": "10.0.0.12" }`），自定义别名优先级更高。
 
-编辑动作也**不会**在失焦时立即执行：改动先挂在面板上（橙色高亮 + 计数），点「应用修改 (N)」才逐条提交，避免手滑碰一下就把数据改掉。改回列中现有值不会产生待提交项。
+> 插件在 Remote-WSL 场景下优先运行在 WSL 侧（`extensionKind: ["workspace", "ui"]`），驱动直连数据库，不跨网络。
+> 镜像网络模式（`.wslconfig` 中 `networkingMode=mirrored`）下两侧 `127.0.0.1` 双向直通，别名同样适用。
 
----
+## 写 SQL 并执行
 
-## 3. 快速开始
+在任意 `.sql` 文件中：
+
+| 操作 | 快捷键 |
+|---|---|
+| 执行全文 | `Ctrl+Alt+E` |
+| 执行选中 | `Ctrl+Alt+Shift+E` |
+| 新建查询 | `Ctrl+Alt+N` |
+
+编辑器标题栏常驻 **▶ 执行全文 / 执行选中 / 切换连接** 三个按钮，右键菜单也有同样入口，不必记快捷键。多语句脚本会按分号自动拆分、逐条执行，每句单独一个结果集标签，哪句失败一眼可见。
+
+`SELECT` 类语句会自动追加 `LIMIT`，避免误写 `SELECT *` 把整表拉进内存。
+
+## 结果面板
+
+- **顶部是本次实际执行的 SQL**（含自动追加的 `LIMIT`）—— 可以直接改完按 `Ctrl+Enter` 重跑，也可以一键还原。
+- **下方浏览结果**：分页翻页、点击列头排序、单击单元格复制、一键复制整页为 TSV，多结果集用标签切换。
+- **双击单元格可改值**：改动先以橙色高亮挂起，工具栏显示「应用修改 (N)」，点它才真正写库，点「放弃」整体撤销 —— 手滑碰一下不会改坏线上数据。
+- **导出**：CSV（带 BOM，Excel 打开不乱码）、Excel（真 `.xlsx`，冻结表头 + 自动筛选 + 斑马纹 + 自适应列宽）、JSON、JSONL（每行一个对象，便于流式导入）。
+
+### 什么时候可以编辑
+
+改数据比查数据的破坏力大，所以编辑入口是**推导出来的，不是默认给的**：
+
+| 情况 | 结果 |
+|---|---|
+| 驱动未声明支持编辑 | 只读 |
+| 表没有主键，或主键列不在结果列中 | 只读（否则可能改错行） |
+| 语句不是单表 `SELECT`（CTE / UNION / 子查询 / 多语句） | 只读 |
+| 连接勾选了「只读模式」 | 只读，驱动层直接拒绝写操作 |
+
+生成的 `UPDATE` 由驱动负责标识符引用与字面量转义（MySQL 反引号、PostgreSQL 双引号），实际下发的 SQL 会回显在面板上供核对。多格一起提交时逐条执行，某一格失败不影响其余。
+
+## SQL Shell
+
+连接节点右键「打开 SQL Shell」，得到一个交互式终端：输入即执行，结果流式追加，支持取消与上下键回溯历史。
+
+元命令在本地处理，不会下发给数据库：
+
+| 命令 | 作用 |
+|---|---|
+| `\?` | 查看帮助 |
+| `\l` | 列出数据库 |
+| `\dt` | 列出表 |
+| `\c <名字>` | 切换目标数据库 |
+| `\clear` | 清空输出 |
+| `\q` | 关闭面板 |
+
+Shell 走的是和结果面板完全一样的执行链路 —— 只读拦截、危险语句确认、超时、错误翻译一个不少。
+
+## 数据库与账号管理
+
+树视图右键即可完成日常管理，无需离开编辑器：
+
+| 操作 | 入口 |
+|---|---|
+| 查看前 N 行数据 / 查看建表语句 / 生成查询语句 | 表节点右键 |
+| 创建数据库（可选字符集、编码） | 已连接节点右键 |
+| 创建用户并授权（可加多条授权记录） | 已连接节点右键 |
+| 删除表 / 删除数据库 | 表节点、数据库节点右键 |
+| 切换数据库会话 | 已连接节点右键（PostgreSQL 需要） |
+
+删除表 / 库会先弹确认框再执行，执行后自动刷新树视图。
+
+## 备份
+
+### 备份选中的数据表
+
+在连接树里 **Ctrl / Shift 多选**表（或视图），右键 →「备份数据表…」，选中的表导出到**同一个** SQL 文件。
+
+选中的节点来自不同连接时会被拒绝 —— 一次操作只产出一个文件，事后才好找；同名表出现在不同库 / schema 下也不会被漏掉。
+
+### 备份整个数据库
+
+| 右键的位置 | 备份范围 |
+|---|---|
+| 数据库节点（MySQL）/ schema 节点（PostgreSQL） | 该库 / 该 schema 下的全部对象 |
+| 已连接的连接节点 | 该连接可见的全部对象（PostgreSQL 为所有 schema） |
+
+### 备份方式
+
+MySQL 与 PostgreSQL 都提供四种，弹出列表会按入口范围自动过滤：
+
+| 方式 | 内容 | 依赖 |
+|---|---|---|
+| 完整 SQL | 建表语句 + 数据 | 内置，无需额外安装 |
+| 仅表结构 | 只导建表语句 | 内置 |
+| 仅数据 | 只导 `INSERT` | 内置 |
+| 原生 `mysqldump` / `pg_dump` | 额外包含索引、外键、触发器、序列、注释等 | 需本机已安装该工具，并开启 `dbviewer.allowExternalCommand` |
+
+原生方式只支持整库导出，因此不会出现在表节点右键菜单里；选中它时若外部命令仍被关闭，会弹出提示并可直接改用内置方式，不必重跑一次命令。
+
+内置导出的几个特点：
+
+- **流式写盘** —— 按块读取、边收边写，内存占用与库大小无关，进度逐表刷新，随时可取消；取消后不会留下半截文件（截断的 `.sql` 看起来是完整的，导入到一半才报错）。
+- **单表失败不拖累其余** —— 某张表读不动就跳过它继续，并在**文件尾部**写明跳过了什么、为什么。
+- **数据保真** —— 时间列按服务端原样字符串写出（不经时区往返换算），二进制列按十六进制，PostgreSQL 数组按数组字面量。
+- 视图只导定义，不导数据。
+
+生成的 `.sql` 文件头写明了连接、范围、方式、对象数量与生成时间 —— 几个月后需要还原时，这份文件自己就能说明它是什么、有什么缺口。
+
+还原用对应客户端即可：
 
 ```bash
-npm install
-npm run compile
+mysql -u 用户名 -p 库名 < 备份文件.sql
+psql -U 用户名 -d 库名 -f 备份文件.sql
 ```
 
-### 调试运行
+## 数据安全
 
-1. 用 VS Code 打开本目录；
-2. 按 `F5`（选择 "运行扩展"）启动扩展开发宿主；
-3. 在新窗口左侧活动栏点击 DBViewer 图标 → 点击标题栏的 `+` 添加连接，填写表单后「保存并连接」。
+- **密码只进系统凭据存储**，不写入任何配置文件或工作区设置。
+- **危险语句二次确认**：`INSERT` / `UPDATE` / `DELETE` / `DROP` / `TRUNCATE` / `ALTER` 执行前弹确认，可在设置中关闭（`dbviewer.confirmDestructiveStatements`）。
+- **只读连接**：勾选后驱动层直接拒绝写语句，不依赖上层判断。
+- **改动先挂起**：结果表格编辑与批量提交都要显式确认，不会失焦即落库。
 
-### 打包安装
+## 配置项
 
-```bash
-npm run package     # 生成 dbviewer-<version>.vsix
-code --install-extension dbviewer-<version>.vsix
-```
-
-> 打包使用 `npm run package`（内部为 `npx @vscode/vsce@3 package --allow-missing-repository`）。
-> **不要加 `--no-dependencies`**：那会把 `node_modules` 排除在外，安装后 `require('mysql2')` 直接失败。
-
-### 测试
-
-```bash
-npm run test:smoke      # 核心逻辑冒烟测试（52 项，不依赖 VS Code）
-npm run test:activate   # 扩展激活 + 连接表单 + 结果面板测试（51 项，mock vscode 后真实调用 activate）
-npm test                # 依次执行上述两项
-```
-
-激活测试会校验：代码注册的命令与 `package.json` 声明双向一致、树视图创建、表单字段完整性、引导数据可解析、主机别名解析回传、非法输入不落盘、密码只进 SecretStorage、编辑模式下不误清已存密码；以及结果面板的 SQL 回传、面板内改写 SQL 的执行回调、按主键定位的单元格更新（含类型还原与 NULL 语义）、批量提交与单格失败隔离、只读结果集拒绝编辑、四种导出格式的落盘内容。
-
----
-
-## 4. 配置项
+设置中搜索 `DBViewer`，或直接编辑 `settings.json`：
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `dbviewer.defaultPageSize` | `200` | 查询结果默认最大返回行数，`0` 表示不限制 |
+| `dbviewer.defaultPageSize` | `200` | 查询默认返回行数，`0` 表示不限制 |
 | `dbviewer.maxResultRows` | `5000` | 结果面板单次展示上限 |
-| `dbviewer.queryTimeoutMs` | `60000` | 单条语句执行超时 |
-| `dbviewer.connectTimeoutMs` | `15000` | 建立连接超时 |
-| `dbviewer.driverHostMode` | `inProcess` | `inProcess` 在扩展宿主内执行；`sidecar` 在独立子进程中执行 |
-| `dbviewer.autoResolveHost` | `true` | 是否自动解析主机别名 |
-| `dbviewer.hostAliases` | `{}` | 自定义别名，如 `{"__prod__": "10.0.0.12"}` |
-| `dbviewer.allowExternalCommand` | `false` | 是否允许调用 `wsl.exe` / `wslinfo` 辅助探测 |
+| `dbviewer.queryTimeoutMs` | `60000` | 单条语句执行超时（毫秒） |
+| `dbviewer.connectTimeoutMs` | `15000` | 建立连接超时（毫秒） |
 | `dbviewer.confirmDestructiveStatements` | `true` | 写操作前二次确认 |
+| `dbviewer.autoResolveHost` | `true` | 自动解析主机别名，关闭后需填真实地址 |
+| `dbviewer.hostAliases` | `{}` | 自定义别名映射，优先级高于内置别名 |
+| `dbviewer.driverHostMode` | `inProcess` | `inProcess` 在扩展宿主内执行；`sidecar` 在独立子进程执行，驱动崩溃或阻塞不会拖累编辑器 |
+| `dbviewer.allowExternalCommand` | `false` | 是否允许调用外部命令：探测网络环境的 `wsl.exe` / `wslinfo`，以及备份时的 `mysqldump` / `pg_dump`。默认关闭 —— 受管控的机器上这类调用常被安全策略拦截 |
+| `dbviewer.backupToolPaths` | `{}` | 原生备份工具的路径映射，如 `{ "mysqldump": "C:/Program Files/MySQL/MySQL Server 8.0/bin/mysqldump.exe" }`。留空则按 `PATH` 查找 |
 
-### 关于 `driverHostMode`
+> 默认路径**完全不依赖子进程**：WSL → Windows 读 `/proc/net/route` 取默认网关，Windows → WSL 直接用 `127.0.0.1`。只有显式打开 `dbviewer.allowExternalCommand` 才会尝试调外部命令。
 
-| 模式 | 执行位置 | 适用场景 |
-|---|---|---|
-| `inProcess` | 扩展宿主进程 | 默认。延迟最低，无 IPC 开销 |
-| `sidecar` | fork 出的子进程 | 驱动阻塞 / 崩溃不拖累编辑器；扩展宿主不加载驱动 SDK |
+## 常见问题
 
-两种模式下驱动实现完全相同，上层业务代码没有任何模式分支——差异被隔离在 `ProcessChannel` 与 `SidecarDriverProxy` 内。子进程启动会自动处理 Windows 特有细节（`ELECTRON_RUN_AS_NODE=1`、`windowsHide`、UTF-8 编码）。
+**连不上，怎么办？**
+执行命令面板的 `DBViewer: 诊断运行环境（Windows / WSL）`，会输出插件运行位置、别名解析结果、驱动状态和针对性建议。多数问题出在这三处：
 
----
+1. 数据库只监听 `127.0.0.1`（MySQL `bind-address` / PostgreSQL `listen_addresses`）→ 跨环境访问必然失败，需改为 `0.0.0.0`；
+2. 账号授权范围不够 —— MySQL 看 Host 字段，PostgreSQL 看 `pg_hba.conf`；
+3. 宿主机防火墙未放行端口（Windows Defender 默认拦截入站）。
 
-## 5. 扩展新数据库驱动
+**为什么连接节点是单击连接，不是双击？**
+VS Code 树视图本身不提供双击事件，只能挂单击回调。已连接的节点不挂该回调，单击仍是选中 / 展开。
 
-新增一种数据库**不需要修改本插件任何现有代码**。
+**PostgreSQL 怎么浏览别的库？**
+PostgreSQL 的库在握手阶段就确定了，需在已连接节点右键「选择数据库…」重建会话（不改动已保存的配置）。
 
-### 步骤 1：实现接口
+**建表语句和实际结构有出入？**
+PostgreSQL 的建表语句由系统目录拼装，是近似结果，不含索引 / 触发器 / 外键。需要精确结构请用 `pg_dump --schema-only`。
 
-在 `src/drivers/` 下新建 `xxx.ts`：
+## 面向开发者：扩展数据库驱动
+
+新增一种数据库**不需要修改插件任何现有代码**。实现 `IDatabaseDriver` 接口 → 在驱动定义表里登记元数据 → 在注册表里补一行工厂函数，编译即生效：树视图层级、连接表单下拉框、结果渲染都会自动适配。
 
 ```ts
-import { IDatabaseDriver /* 其余类型 */ } from '../core/types';
-
 export class XxxDriver implements IDatabaseDriver {
   readonly id = 'xxx';
   readonly displayName = 'XXX 数据库';
   readonly defaultPort = 1234;
-  readonly aliases = ['xxx-alias'];
   readonly capabilities = {
     columns: true,
     schemas: false,   // 决定树视图是「库 → 表」还是「schema → 表」
     ddl: true,        // 声明为 true 必须实现 showCreateTable()
     multiStatement: true,
     editable: false,  // 声明为 true 必须实现 updateCell()
+    backup: false,    // 声明为 true 必须实现 backupChunks()
   };
-
-  async connect(options: DriverConnectOptions) { /* ... */ }
-  async disconnect() { /* ... */ }
-  isConnected() { /* ... */ }
-  async ping() { /* ... */ }
-  async listDatabases() { /* ... */ }
-  async listSchemas() { /* ... */ }
-  async listTables(target) { /* ... */ }
-  async listColumns(target) { /* ... */ }
-  async execute(sql, options) { /* ... */ }
-
-  // 仅当 capabilities.editable 为 true 时需要。必须是 async：
-  // sidecar 模式下驱动跑在子进程，同步方法无法跨进程调用。
-  async updateCell(request: CellUpdateRequest, options: ExecuteOptions): Promise<CellUpdateResult> {
-    const sql = `UPDATE ...`;           // 标识符引用与字面量转义由驱动自己负责
-    const result = await this.execute(sql, { ...options, limit: 0 });
-    return { sql, affectedRows: result.sets.reduce((n, s) => n + (s.affectedRows ?? 0), 0) };
-  }
+  // connect / disconnect / isConnected / ping
+  // listDatabases / listSchemas / listTables / listColumns / execute
 }
 ```
 
-实现 `execute` 时**只需处理单条语句**，多语句拆分与结果汇总由 `src/drivers/support.ts` 的 `executeScript` 统一完成。
+`execute()` 只需处理单条语句，多语句拆分与结果汇总由公共框架完成。驱动 SDK 是**惰性加载**的 —— 只有在真正建立连接时才 `require`，因此「新建连接」下拉框不会额外加载数 MB 代码。
 
-`DriverRegistry.validate(driver)` 用于自检能力声明与实现的对应关系：声明 `ddl: true` 却没实现 `showCreateTable()`、声明 `editable: true` 却没实现 `updateCell()`、声明 `columns: true` 却没实现 `listColumns()`、声明 `schemas: true` 却没实现 `listSchemas()`、默认端口非法，都会被逐条列出（内置驱动的测试里会对每个驱动断言该列表为空）。
+备份同理按数据声明：驱动在元数据里列出 `backupModes`（方式名、扩展名、是否含结构 / 数据、是否依赖外部命令、适用范围），命令层只负责把这份列表渲染成选项。原生工具的参数模板也写在元数据里（`nativeBackup`），占位符由框架替换、密码只走环境变量。
 
-### 步骤 2：登记元数据
+第三方驱动也可以做成独立 npm 包，导出 `register(registry)` 即可接入，无需本插件发版。
 
-在 `src/drivers/definitions.ts` 中追加定义（纯数据，**不要 import 驱动 SDK**，否则「新建连接」下拉框会白白加载几 MB 代码）：
+## 已知限制
 
-```ts
-export const XXX_DEFINITION: DriverDefinition = { /* ... */ };
-export const BUILTIN_DEFINITIONS = [MYSQL_DEFINITION, PG_DEFINITION, XXX_DEFINITION];
-```
-
-### 步骤 3：注册（惰性工厂）
-
-在 `src/drivers/index.ts` 的 `registerBuiltinDrivers` 中补一行。注意 `require` 写在工厂函数体内，实例化时才加载 SDK：
-
-```ts
-const factories: Record<string, DriverFactory> = {
-  mysql: () => new (require('./mysql') as typeof import('./mysql')).MySqlDriver(),
-  postgresql: () => new (require('./pg') as typeof import('./pg')).PostgresDriver(),
-  xxx: () => new (require('./xxx') as typeof import('./xxx')).XxxDriver(),
-};
-```
-
-编译即生效：树视图层级、连接向导下拉框、结果渲染都会自动适配。
-
-### 外部驱动（不修改本插件源码）
-
-独立 npm 包导出 `register(registry)` 即可，通过 `loadExternalDrivers()` 加载：
-
-```ts
-export function register(registry: DriverRegistry) {
-  registry.register(MY_DEFINITION, () => new MyDriver());
-}
-```
+- 多语句脚本依赖按分号自动拆分；MySQL 存储过程脚本若使用 `DELIMITER` 指令，会整体作为单条语句提交，此时脚本内多条语句需服务器支持（常规 DDL / DML 脚本不受影响）。
+- 内置备份按逐表 `SELECT` 导出，**不包含**索引、外键、触发器、存储过程与序列；需要完整结构请改用原生方式，或在命令行跑 `mysqldump` / `pg_dump`。生成的文件里也不含 `CREATE DATABASE` / `CREATE SCHEMA`，还原前需先建好库 / schema。
+- `__wsl_host__` 在 Windows 侧默认按 `127.0.0.1` 处理。若 WSL 的 localhost 转发被关闭，需手工填写 WSL 的真实 IP，或开启 `dbviewer.allowExternalCommand`（注意可能被安全策略拦截）。
+- SSL 暂不支持指定 CA 与客户端证书路径。
 
 ---
-
-## 6. 目录结构
-
-```
-src/
-├── extension.ts                # 入口：环境探测 → 驱动注册 → 树视图 → 命令
-├── core/
-│   ├── types.ts                # 领域类型 + IDatabaseDriver 契约（不依赖 vscode）
-│   ├── driverRegistry.ts       # 驱动注册表：元数据与工厂分离，支持别名解析
-│   ├── connectionStore.ts      # 配置持久化 + SecretStorage 密码管理
-│   ├── connectionManager.ts    # 连接生命周期；唯一的 inProcess/sidecar 分支点
-│   └── sqlText.ts              # 语句切分、危险语句识别、标识符转义、值序列化
-├── platform/                   # ← 跨环境差异全部收敛在此层
-│   ├── environment.ts          # Windows / WSL 探测（不依赖外部命令）
-│   ├── hostResolver.ts         # 主机别名解析与跨环境风险提示
-│   ├── paths.ts                # Windows ↔ WSL 路径互转
-│   └── processChannel.ts       # 跨平台子进程 RPC 通道
-├── drivers/
-│   ├── definitions.ts          # 驱动静态元数据（无 SDK 依赖）
-│   ├── support.ts              # 多语句执行器（驱动共用）
-│   ├── mysql.ts / pg.ts        # 具体驱动实现
-│   ├── sidecarProxy.ts         # 把调用转发到子进程的驱动代理
-│   └── index.ts                # 内置驱动注册
-├── sidecar/host.ts             # 子进程入口
-├── views/
-│   ├── connectionsTree.ts      # 侧边栏树
-│   ├── connectionFormPanel.ts  # 连接配置表单（新增 / 编辑）
-│   └── resultPanel.ts          # Webview 结果面板
-└── commands/index.ts           # 命令层：表单入口 / 执行 / 导出 / 诊断
-media/                          # Webview 前端资源
-├── connectionForm.css / .js    # 连接表单
-├── result.css / .js            # 结果面板
-└── dbviewer.svg                # 活动栏图标
-scripts/                        # 冒烟测试与激活测试
-```
-
----
-
-## 7. 已知限制
-
-- **连接节点是单击连接，不是双击**：VS Code 的树视图只暴露单击回调（`TreeItem.command`），没有双击事件。已连接的节点不挂该回调，单击仍只是选中 / 展开。
-- **多语句依赖自行拆分**：MySQL 存储过程脚本若使用 `DELIMITER` 指令，会整体作为单条语句提交，此时脚本内的多条语句需服务器支持。常规 DDL/DML 脚本不受影响。
-- **PG 跨库浏览**：PostgreSQL 的库在握手阶段确定，浏览其他库需通过连接右键「选择数据库…」重建连接（会话级切换，不修改保存的配置）。
-- **PG 建表语句为近似结果**：由系统目录拼装，不含索引 / 触发器 / 外键。需要精确结构请用 `pg_dump --schema-only`。
-- **`__wsl_host__` 在 Windows 侧默认按 `127.0.0.1` 处理**：若 WSL 的 localhost 转发被关闭，需手工填写 WSL 的 `hostname -I` 结果，或开启 `dbviewer.allowExternalCommand`（注意可能被安全策略拦截）。
-- SSL 目前为「启用即跳过证书校验」，暂不支持指定 CA / 客户端证书路径。
-
----
-
-## 8. 排查清单
-
-连接失败时按顺序检查：
-
-1. 执行 `DBViewer: 诊断运行环境`，确认插件运行在 Windows 还是 WSL、别名解析到了哪个 IP；
-2. 若数据库监听 `127.0.0.1`（MySQL `bind-address` / PG `listen_addresses`），跨环境访问必然失败，需改为 `0.0.0.0`；
-3. 账号授权范围：MySQL 的 Host 字段、PG 的 `pg_hba.conf` 需放行来源网段；
-4. 宿主防火墙是否放行端口（Windows Defender 默认拦截入站）。
 
 License: MIT

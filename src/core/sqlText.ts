@@ -280,3 +280,81 @@ export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: 
     );
   });
 }
+
+// ---------------------------------------------------------------- 备份字面量
+
+/**
+ * 把原始值渲染成备份文件里可用的 SQL 字面量。
+ *
+ * 与 `toSqlLiteral` 的区别是「保真优先」，因为备份文件的唯一用途是**还原**：
+ * - `Date` 用本地时区的 `'YYYY-MM-DD HH:mm:ss.SSS'`，而不是 ISO 串 —— ISO 里的
+ *   `T` 与 `Z` 在 MySQL 下语义不明确，跨时区还原会偏移；
+ * - `Buffer` 用十六进制字节字面量（MySQL `X'..'`、PG `'\x..'::bytea`），
+ *   `toString()` 会把二进制彻底毁掉；
+ * - PG 的数组用数组字面量 `'{...}'`，JSON 化后 `int[]` 列会插入失败。
+ *
+ * 只负责「值 → 字面量」，标识符引用交给 `quoteMysqlIdent` / `quotePgIdent`。
+ */
+export function toBackupLiteral(value: unknown, dialect: 'mysql' | 'postgresql'): string {
+  if (value === null || value === undefined) {
+    return 'NULL';
+  }
+  if (typeof value === 'boolean') {
+    return dialect === 'mysql' ? (value ? '1' : '0') : value ? 'TRUE' : 'FALSE';
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? String(value) : 'NULL';
+  }
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (value instanceof Date) {
+    return quoteTimestamp(value, dialect);
+  }
+  if (Buffer.isBuffer(value)) {
+    const hex = value.toString('hex');
+    return dialect === 'mysql' ? `X'${hex}'` : `'\\x${hex}'::bytea`;
+  }
+  if (Array.isArray(value)) {
+    // MySQL 没有数组类型，走到这里只可能是 JSON 列里嵌的数组
+    const text = dialect === 'mysql' ? JSON.stringify(value) : pgArrayLiteral(value);
+    return dialect === 'mysql' ? quoteMysqlString(text) : quotePgString(text);
+  }
+  if (typeof value === 'object') {
+    // PG 的 json / jsonb 会反序列化成对象，写回 JSON 文本即可被隐式转换
+    const text = JSON.stringify(value);
+    return dialect === 'mysql' ? quoteMysqlString(text) : quotePgString(text);
+  }
+  const text = String(value);
+  return dialect === 'mysql' ? quoteMysqlString(text) : quotePgString(text);
+}
+
+function quoteTimestamp(value: Date, dialect: 'mysql' | 'postgresql'): string {
+  const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+  const text =
+    `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}` +
+    ` ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}` +
+    `.${pad(value.getMilliseconds(), 3)}`;
+  return dialect === 'mysql' ? quoteMysqlString(text) : quotePgString(text);
+}
+
+/**
+ * PG 数组字面量。
+ *
+ * 元素一律用双引号包裹并转义反斜杠与引号，空元素写 `NULL`——
+ * 这样无论元素是数字、时间还是含逗号的文本都能被解析回原值；
+ * 嵌套数组直接递归拼接（PG 期望 `{{1,2},{3,4}}`，外层不能再加引号）。
+ */
+export function pgArrayLiteral(values: unknown[]): string {
+  const parts = values.map((item) => {
+    if (item === null || item === undefined) {
+      return 'NULL';
+    }
+    if (Array.isArray(item)) {
+      return pgArrayLiteral(item);
+    }
+    const text = item instanceof Date ? item.toISOString() : String(item);
+    return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  });
+  return `{${parts.join(',')}}`;
+}

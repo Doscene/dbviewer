@@ -80,6 +80,43 @@ class ThemeColor {
   }
 }
 
+/**
+ * 取消令牌源。
+ *
+ * mock 里必须提供：`withProgress` 的真实回调签名是 `(progress, token)`，备份这类
+ * 长任务会在回调里注册 `token.onCancellationRequested`。少了它，相关代码会直接
+ * 抛 TypeError 并被自身的 try/catch 吞掉，测试反而「通过」。
+ */
+class CancellationTokenSource {
+  constructor() {
+    const listeners = [];
+    this.token = {
+      isCancellationRequested: false,
+      onCancellationRequested: (listener) => {
+        listeners.push(listener);
+        return new Disposable(() => {
+          const index = listeners.indexOf(listener);
+          if (index >= 0) {
+            listeners.splice(index, 1);
+          }
+        });
+      },
+    };
+    this._fire = () => {
+      this.token.isCancellationRequested = true;
+      for (const listener of [...listeners]) {
+        listener();
+      }
+    };
+  }
+  cancel() {
+    this._fire();
+  }
+  dispose() {
+    this._fire = () => undefined;
+  }
+}
+
 class MarkdownString {
   constructor(value) {
     this.value = value ?? '';
@@ -115,6 +152,7 @@ const vscodeMock = {
   TreeItem,
   ThemeIcon,
   ThemeColor,
+  CancellationTokenSource,
   MarkdownString,
   Uri,
   Selection: class {
@@ -170,7 +208,11 @@ const vscodeMock = {
     showSaveDialog: async () => saveDialogResult,
     showTextDocument: async () => ({ selection: undefined, document: undefined }),
     setStatusBarMessage: () => new Disposable(),
-    withProgress: async (_options, task) => task({ report: () => undefined }),
+    withProgress: async (_options, task) =>
+      task(
+        { report: () => undefined },
+        new CancellationTokenSource().token,
+      ),
     createWebviewPanel: (viewType, title, viewColumn, options) => {
       const received = [];
       const posted = [];
@@ -409,6 +451,8 @@ function makeContext() {
     'dbviewer.exportResult',
     'dbviewer.clearResult',
     'dbviewer.pickConnection',
+    'dbviewer.backupTables',
+    'dbviewer.backupDatabase',
   ];
   for (const id of safeCommands) {
     await check(`${id} 空参调用不抛异常`, async () => {
@@ -979,11 +1023,13 @@ function makeContext() {
     assert.strictEqual(shellView.title, 'SQL Shell · 本地 MySQL');
   });
 
-  await check('SQL Shell 界面含输入框、执行与元命令入口', () => {
+  await check('SQL Shell 界面含输入框、元命令入口与执行提示', () => {
     const html = shellView.webview.html;
-    for (const id of ['input', 'runBtn', 'clearBtn', 'helpBtn', 'output', 'bootstrap']) {
+    for (const id of ['input', 'clearBtn', 'helpBtn', 'output', 'bootstrap']) {
       assert.ok(html.includes(`id="${id}"`), `SQL Shell 缺少 #${id}`);
     }
+    // 执行入口已改为 Enter 直接提交（不再有独立执行按钮），故只断言提示行存在
+    assert.ok(html.includes('class="input-hint"'), 'SQL Shell 缺少执行提示行');
   });
 
   await check('引导数据带连接信息与元命令帮助', () => {

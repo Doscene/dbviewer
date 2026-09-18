@@ -13,9 +13,14 @@
 import { Client, ClientConfig } from 'pg';
 
 import { PG_DEFINITION } from './definitions';
+import { PG_BACKUP_TYPE_PARSERS, PgBackupSession } from './pgBackup';
+import { runBackupChunks } from './backupCore';
 import { buildResultSet, executeScript } from './support';
 import { pgQualified, quotePgIdent, quotePgString, sanitizeValue, toSqlLiteral, withTimeout } from '../core/sqlText';
 import {
+  BackupChunk,
+  BackupChunkRequest,
+  BackupTarget,
   CellUpdateRequest,
   CellUpdateResult,
   ColumnNode,
@@ -45,6 +50,12 @@ export class PostgresDriver implements IDatabaseDriver {
   private client?: Client;
   private queryTimeoutMs = 60_000;
   private readOnly = false;
+  /**
+   * 保留连接入参：备份需要另开一条连接，而密码只有这里拿得到。
+   * 存的是内存里的副本，不落盘；`disconnect()` 会连同它一起清掉。
+   */
+  private connectOptions?: DriverConnectOptions;
+  private backupSession?: PgBackupSession;
 
   async connect(options: DriverConnectOptions): Promise<void> {
     await this.disconnect();
@@ -81,9 +92,22 @@ export class PostgresDriver implements IDatabaseDriver {
     this.client = client;
     this.queryTimeoutMs = queryTimeoutMs;
     this.readOnly = !!profile.readOnly;
+    this.connectOptions = options;
   }
 
   async disconnect(): Promise<void> {
+    // 备份连接先收：它可能正卡在一张大表的读取上，让主连接先走会留下孤儿连接
+    const backup = this.backupSession;
+    this.backupSession = undefined;
+    this.connectOptions = undefined;
+    if (backup) {
+      try {
+        await backup.close();
+      } catch {
+        /* 备份连接断开失败不影响主连接状态 */
+      }
+    }
+
     const client = this.client;
     this.client = undefined;
     if (client) {
@@ -258,6 +282,80 @@ export class PostgresDriver implements IDatabaseDriver {
       lines.join(',\n'),
       ');',
     ].join('\n');
+  }
+
+  // ---------------------------------------------------------------- 备份
+
+  /**
+   * 产出备份文本片段。
+   *
+   * 与 MySQL 侧同理：另开一条连接，避免长时间读取把交互查询堵在同一条连接上。
+   */
+  async backupChunks(request: BackupChunkRequest): Promise<BackupChunk> {
+    if (!this.connectOptions) {
+      throw new DatabaseError('PostgreSQL 连接尚未建立', 'ENOT_CONNECTED');
+    }
+    const mode = PG_DEFINITION.backupModes?.find((item) => item.id === request.modeId);
+    if (!mode) {
+      throw new DatabaseError(`未知的备份方式：${request.modeId}`, 'ENO_BACKUP_MODE');
+    }
+    if (!this.backupSession) {
+      this.backupSession = new PgBackupSession({
+        connect: () => this.createBackupClient(),
+        release: async (client) => {
+          try {
+            await client.end();
+          } catch {
+            /* 已失效，忽略 */
+          }
+        },
+        // 复用驱动已有的近似 DDL 拼装，不另起一份
+        createTableSql: (target: BackupTarget) => this.showCreateTable(target),
+      });
+    }
+    return runBackupChunks(this.backupSession.dialect(), mode, request);
+  }
+
+  /**
+   * 建备份专用连接。
+   *
+   * 除了装配「原样文本」类型解析器（见 `pgBackup.ts` 的说明），还把 `statement_timeout`
+   * 设为 0：读一整张大表本身就是长语句，套用交互查询的超时会让它被服务端中途取消。
+   * 真正的超时保护改由每一块的 `withTimeout` 承担——块级粒度既能兜住卡死，
+   * 又不会误杀正在正常推进的大表读取。
+   */
+  private async createBackupClient(): Promise<Client> {
+    const options = this.connectOptions;
+    if (!options) {
+      throw new DatabaseError('PostgreSQL 连接尚未建立', 'ENOT_CONNECTED');
+    }
+    const profile = options.connection.profile;
+    const client = new Client({
+      host: options.connection.host,
+      port: profile.port,
+      user: profile.user,
+      password: options.connection.password,
+      database: profile.database || 'postgres',
+      connectionTimeoutMillis: options.connectTimeoutMs,
+      statement_timeout: 0,
+      query_timeout: 0,
+      application_name: 'vscode-dbviewer-backup',
+      keepAlive: true,
+      ssl: profile.ssl ? { rejectUnauthorized: false } : undefined,
+      types: PG_BACKUP_TYPE_PARSERS,
+    });
+    try {
+      await client.connect();
+    } catch (err) {
+      // 连接失败必须显式结束，否则 pg 会留下悬空的 socket 与定时器
+      try {
+        await client.end();
+      } catch {
+        /* 忽略 */
+      }
+      throw normalizePgError(err, options.connection.host, profile.port);
+    }
+    return client;
   }
 
   // ---------------------------------------------------------------- 内部实现

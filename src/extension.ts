@@ -49,6 +49,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const treeView = vscode.window.createTreeView('dbviewer.connections', {
     treeDataProvider: tree,
     showCollapseAll: true,
+    // 多选是「批量备份表」的前提：勾选若干张表后右键一次导出。
+    // 命令回调的第二个参数会拿到全部选中项，第一个参数仍是右键点中的那一项。
+    canSelectMany: true,
   });
 
   const commands = registerCommands({

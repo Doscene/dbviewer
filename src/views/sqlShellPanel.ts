@@ -344,10 +344,12 @@ function buildHtml(
     <div id="welcome" class="welcome"></div>
   </main>
   <footer class="input-area">
-    <span class="prompt">sql&gt;</span>
-    <textarea id="input" rows="2" spellcheck="false" autocomplete="off"
-      placeholder="输入 SQL，Enter 或 Ctrl+Enter 执行，Shift+Enter 换行；\\? 查看命令"></textarea>
-    <button id="runBtn" type="button" class="primary">执行</button>
+    <div class="input-line">
+      <span class="prompt">sql&gt;</span>
+      <textarea id="input" rows="1" spellcheck="false" autocomplete="off"
+        placeholder="输入 SQL，Enter 执行，Shift+Enter 换行；\\? 查看命令"></textarea>
+    </div>
+    <div class="input-hint">Enter 执行 · Shift+Enter 换行 · ↑↓ 翻历史</div>
   </footer>
   <div id="toast" class="toast"></div>
   <script type="application/json" id="bootstrap">${bootstrap}</script>

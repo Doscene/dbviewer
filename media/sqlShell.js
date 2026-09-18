@@ -20,7 +20,6 @@
   const output = document.getElementById('output');
   const welcome = document.getElementById('welcome');
   const input = document.getElementById('input');
-  const runBtn = document.getElementById('runBtn');
   const clearBtn = document.getElementById('clearBtn');
   const helpBtn = document.getElementById('helpBtn');
   const connName = document.getElementById('connName');
@@ -64,6 +63,11 @@
     toast.classList.add('show');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toast.classList.remove('show'), 1500);
+  }
+
+  function adjustInputHeight() {
+    input.style.height = 'auto';
+    input.style.height = `${input.scrollHeight}px`;
   }
 
   // ---------------------------------------------------------------- 顶部信息
@@ -115,7 +119,7 @@
       node.dataset.id = String(entry.id);
 
       const cmd = el('div', 'cmd');
-      cmd.appendChild(el('span', 'chev', '›'));
+      cmd.appendChild(el('span', 'prompt', 'sql>'));
       cmd.appendChild(el('pre', null, entry.sql || ''));
 
       node.appendChild(cmd);
@@ -261,6 +265,7 @@
     draft = '';
     persist();
     input.value = '';
+    input.style.height = 'auto';
     input.focus();
     vscode.postMessage({ type: 'submit', sql });
   }
@@ -279,6 +284,7 @@
     historyIndex = next;
     input.value = historyIndex === history.length ? draft : history[historyIndex];
     input.setSelectionRange(input.value.length, input.value.length);
+    adjustInputHeight();
   }
 
   function onCaretFirstLine() {
@@ -307,7 +313,8 @@
     }
   });
 
-  runBtn.addEventListener('click', submit);
+  input.addEventListener('input', adjustInputHeight);
+
   clearBtn.addEventListener('click', () => {
     resetOutput();
     vscode.postMessage({ type: 'clear' });
