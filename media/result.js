@@ -178,7 +178,7 @@
         state.running = false;
         el.content.innerHTML = '';
         el.tabs.innerHTML = '';
-        el.target.textContent = state.connectionName || '查询结果';
+        el.target.textContent = headerLabel();
         el.stats.textContent = '';
         syncSqlEditor();
         renderSql();
@@ -200,7 +200,7 @@
         el.content.innerHTML = '<div class="placeholder">执行查询后，结果将显示在此处。</div>';
         el.tabs.innerHTML = '';
         el.stats.textContent = '';
-        el.target.textContent = '查询结果';
+        el.target.textContent = headerLabel();
         syncSqlEditor();
         renderSql();
         renderEditControls();
@@ -267,8 +267,17 @@
     renderPager();
   }
 
+  // 头部目标文案：表数据预览会开好几个窗口，只写「库.表」看不出数据来自哪个连接，
+  // 连接名作为后缀补上（窗口标签本身仍是「库.表」）。
+  function headerLabel() {
+    if (state.target && state.connectionName) {
+      return `${state.target} · ${state.connectionName}`;
+    }
+    return state.target || state.connectionName || '查询结果';
+  }
+
   function renderHeader() {
-    el.target.textContent = state.target || state.connectionName || '查询结果';
+    el.target.textContent = headerLabel();
     const parts = [];
     if (state.sets.length > 1) {
       parts.push(`${state.sets.length} 条语句`);

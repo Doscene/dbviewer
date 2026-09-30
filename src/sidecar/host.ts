@@ -16,11 +16,14 @@ import {
   CellUpdateRequest,
   CreateDatabaseOptions,
   CreateUserRequest,
+  DatabaseChangeRequest,
   DatabaseError,
+  DatabaseObjectTarget,
   DriverConnectOptions,
   ExecuteOptions,
   IDatabaseDriver,
   QueryTarget,
+  TableChangeRequest,
 } from '../core/types';
 import { executeScript } from '../drivers/support';
 
@@ -151,6 +154,48 @@ async function handle(method: string, params: Record<string, unknown>): Promise<
         throw new DatabaseError(`驱动「${session.driverId}」不支持备份`, 'ENOT_BACKUP');
       }
       return session.driver.backupChunks(params.request as BackupChunkRequest);
+    }
+    case 'describeTable': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.describeTable) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持编辑表结构`, 'ENOT_STRUCTURE');
+      }
+      return session.driver.describeTable(params.target as QueryTarget & { table: string });
+    }
+    case 'planTableChange': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.planTableChange) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持编辑表结构`, 'ENOT_STRUCTURE');
+      }
+      return session.driver.planTableChange(params.request as TableChangeRequest);
+    }
+    case 'applyTableChange': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.applyTableChange) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持编辑表结构`, 'ENOT_STRUCTURE');
+      }
+      return session.driver.applyTableChange(params.request as TableChangeRequest);
+    }
+    case 'describeDatabaseProperties': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.describeDatabaseProperties) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持编辑数据库属性`, 'ENOT_STRUCTURE');
+      }
+      return session.driver.describeDatabaseProperties(params.target as DatabaseObjectTarget);
+    }
+    case 'planDatabaseChange': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.planDatabaseChange) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持编辑数据库属性`, 'ENOT_STRUCTURE');
+      }
+      return session.driver.planDatabaseChange(params.request as DatabaseChangeRequest);
+    }
+    case 'applyDatabaseChange': {
+      const session = requireSession(String(params.connectionId));
+      if (!session.driver.applyDatabaseChange) {
+        throw new DatabaseError(`驱动「${session.driverId}」不支持编辑数据库属性`, 'ENOT_STRUCTURE');
+      }
+      return session.driver.applyDatabaseChange(params.request as DatabaseChangeRequest);
     }
     case 'execute': {
       const session = requireSession(String(params.connectionId));

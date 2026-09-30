@@ -38,7 +38,9 @@
     "onCommand:dbviewer.runQuery",
     "onCommand:dbviewer.openSqlShell",
     "onCommand:dbviewer.createDatabase",
-    "onCommand:dbviewer.createUser"
+    "onCommand:dbviewer.createUser",
+    "onCommand:dbviewer.editTableStructure",
+    "onCommand:dbviewer.editDatabaseProperties"
   ],
   "contributes": {
     "viewsContainers": {
@@ -175,6 +177,18 @@
         "title": "创建用户并授权…",
         "category": "DBViewer",
         "icon": "$(person-add)"
+      },
+      {
+        "command": "dbviewer.editTableStructure",
+        "title": "编辑表结构…",
+        "category": "DBViewer",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "dbviewer.editDatabaseProperties",
+        "title": "编辑数据库属性…",
+        "category": "DBViewer",
+        "icon": "$(edit)"
       },
       {
         "command": "dbviewer.exportResult",
@@ -319,6 +333,16 @@
           "group": "5_manage@4"
         },
         {
+          "command": "dbviewer.editTableStructure",
+          "when": "view == dbviewer.connections && viewItem == dbviewer.table",
+          "group": "3_modify@0"
+        },
+        {
+          "command": "dbviewer.editDatabaseProperties",
+          "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.(database|schema)$/",
+          "group": "3_modify@0"
+        },
+        {
           "command": "dbviewer.backupTables",
           "when": "view == dbviewer.connections && viewItem =~ /^dbviewer\\.(table|view)/",
           "group": "6_backup@1"
@@ -441,6 +465,14 @@
         {
           "command": "dbviewer.pickConnection",
           "when": "false"
+        },
+        {
+          "command": "dbviewer.editTableStructure",
+          "when": "false"
+        },
+        {
+          "command": "dbviewer.editDatabaseProperties",
+          "when": "false"
         }
       ]
     },
@@ -542,6 +574,7 @@
     "lint": "tsc -p ./ --noEmit",
     "test:smoke": "node scripts/smoke-test.js",
     "test:activate": "node scripts/activate-test.js",
+    "test:live": "node scripts/live-mysql-test.js",
     "test": "npm run compile && npm run test:smoke && npm run test:activate",
     "package": "npx @vscode/vsce@3 package --allow-missing-repository",
     "publish": "npx @vscode/vsce@3 publish --allow-missing-repository",

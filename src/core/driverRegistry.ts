@@ -102,6 +102,29 @@ export class DriverRegistry {
     if (caps.backup && typeof driver.backupChunks !== 'function') {
       problems.push(`驱动 ${driver.id} 声明支持备份，但未实现 backupChunks()`);
     }
+    // 结构编辑是三步（读 / 预览 / 应用），少任何一步都会让界面出现「点了没反应」的入口
+    if (caps.editTableStructure) {
+      if (typeof driver.describeTable !== 'function') {
+        problems.push(`驱动 ${driver.id} 声明支持表结构编辑，但未实现 describeTable()`);
+      }
+      if (typeof driver.planTableChange !== 'function') {
+        problems.push(`驱动 ${driver.id} 声明支持表结构编辑，但未实现 planTableChange()`);
+      }
+      if (typeof driver.applyTableChange !== 'function') {
+        problems.push(`驱动 ${driver.id} 声明支持表结构编辑，但未实现 applyTableChange()`);
+      }
+    }
+    if (caps.editDatabaseProperties) {
+      if (typeof driver.describeDatabaseProperties !== 'function') {
+        problems.push(`驱动 ${driver.id} 声明支持库属性编辑，但未实现 describeDatabaseProperties()`);
+      }
+      if (typeof driver.planDatabaseChange !== 'function') {
+        problems.push(`驱动 ${driver.id} 声明支持库属性编辑，但未实现 planDatabaseChange()`);
+      }
+      if (typeof driver.applyDatabaseChange !== 'function') {
+        problems.push(`驱动 ${driver.id} 声明支持库属性编辑，但未实现 applyDatabaseChange()`);
+      }
+    }
     // 声明支持 schema 才要求实现；不支持的驱动（如 MySQL）本就不该有这个方法
     if (caps.schemas && typeof driver.listSchemas !== 'function') {
       problems.push(`驱动 ${driver.id} 声明支持 schema，但未实现 listSchemas()`);

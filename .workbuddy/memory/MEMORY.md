@@ -37,16 +37,31 @@ TS 5.6 / commonjs / ES2022 / strict，含 `noUnusedLocals` `noUnusedParameters`�
 25. 保真字面量走 `sqlText.toBackupLiteral()`，**不要复用 `toSqlLiteral`**（后者服务交互 UPDATE，Date / Buffer / 数组会失真）；`execute()` 的 JSON 清洗同样不能碰备份数据。
 26. 原生备份的方式与参数都是**数据**：`DriverDefinition.backupModes[]`（`scope` 决定出现在哪些入口）+ `nativeBackup` 模板，命令层零 `if (driver === 'mysql')`。外部命令走 `platform/externalTool.ts`（`shell:false` + 参数数组）、**密码只进环境变量**、受 `dbviewer.allowExternalCommand` 管控，工具路径查 `dbviewer.backupToolPaths`（已声明在 package.json）。
 27. 传 `backupChunks` 进闭包前必须先取到 `const`（TS 不保留 `let` 的收窄），驱动实现依赖 `this`，用 `.call(driver, request)`。
+28. 「查看数据」**一张表一个窗口**：`ResultPanel` 是按复用键的注册表（键 = `core/tableTargets.ts` 的 `tableDataPanelKey`，含连接 + 库/schema + 表；缺省键仍是共用的「查询结果」窗口）。`ResultPanel.instance` = 焦点窗口（`onDidChangeViewState` 跟踪，退化为最近显示的那个），导出 / 清空作用于它；`dispose()` 同步注销（不能等 `onDidDispose`，否则关掉后立刻重开是空档）。窗口标题 = `tableDataPanelTitle()` 的「库.表」（schema 优先，PG 用 schema）。多选批量走 `commands/index.ts` 的 `openTableData()`：顺序读取（驱动是单连接）、一条可取消进度、`runSql({ progressTitle: null, notifyError: false, refreshTree: false })`、失败在命令层汇总成一条 + 明细进输出通道。
+
+29. 表结构 / 对象属性编辑与单元格编辑是同一条边界：**Webview 只回传「目标状态」，差异计算与 DDL 生成全在扩展侧，且生成时让驱动重读一次现状**（面板里的原始值只用于渲染，否则挂久了会按过期结构下发语句）。
+   - 方言无关部分在 `core/objectEditor.ts`（`diffTableColumns` / `diffPrimaryKey` / `diffProperties` / `validate*`）；**各方言的 DDL 拼装放独立纯函数模块** `drivers/mysqlStructure.ts` / `drivers/pgStructure.ts`（不 require SDK，冒烟测试直接断言语句），驱动只做「读现状 + 执行」。
+   - 认列唯一凭据是 `originalName`（缺失即视为新列），改名靠它区分于「删旧增新」；`properties.name` 是保留的重命名键，`EditableProperty.editable === false` 的项不参与差异。
+   - 能力位 `editTableStructure` / `editDatabaseProperties` 由驱动声明，`DriverRegistry.validate()` 校验对应方法齐全；`allowReorder` / `allowAutoIncrement` 是驱动给界面的数据（PG 不调序、既有列不给自增开关），视图层不得按驱动名分支。
+   - 预览与应用共用同一个 `plan()`；`applyTableChange` 内部重新 `plan` 再执行，保证「看到的 SQL」= 「执行的 SQL」。语句统一经 `driver.execute()` 下发，只读连接照样被拦。
+   - MySQL：一条组合 `ALTER TABLE`，子句顺序 **DROP PRIMARY KEY → 列子句（CHANGE/MODIFY/ADD，同一列只出现一次）→ DROP COLUMN → ADD PRIMARY KEY → 属性 → 末尾 RENAME TABLE**；DDL 无法回滚，逐条执行并报「第 N 条失败、前 M 条已生效」。`COLUMN_DEFAULT` 是不带引号的裸文本，要按列类型补引号，`''` 与「无默认值」不可混淆。`ALTER DATABASE` 用 `CHARACTER SET =`（没有 `DEFAULT` 关键字），**多个选项只能空格相连、不能加逗号**（真库实测），`ALTER TABLE` 才是逗号分隔。只改字符集时补该字符集的默认排序规则（`SHOW CHARACTER SET LIKE`）。
+   - MySQL 默认值三种真库实测形态，缺一不可：① 裸文本按类型补引号；② 表达式（函数调用 / 手打算式 / 已带括号）写 `DEFAULT (expr)`，读回来的 `_utf8mb4\'hello\'` 形态**必须先反转义**（单次左到右扫描，连续 replace 会把 `\\'` 吃两层）；③ TEXT / BLOB / JSON / GEOMETRY 列**只能**表达式形式，任何用户输入都渲染成 `DEFAULT ('…')`（MySQL 8.0.13 起支持，更早版本无解，服务端会拒）。
+   - **列上「看不见的子句」必须原样往返**：`ON UPDATE CURRENT_TIMESTAMP` 只存在于 `information_schema.COLUMNS.EXTRA`，不属于类型 / 默认值 / 可空，改写列时漏掉就是静默改表行为（服务端不报错）。因此 `TableColumnDefinition.extraClauses` 由驱动填入、界面用隐藏域带回并显式标注、渲染时接在 DEFAULT 之后；请求缺失时 `inheritMysqlExtraClauses()` 按 `originalName` 从现状继承。
+   - PostgreSQL：每条改动独立成句（`ALTER COLUMN ... TYPE ... USING 列::类型` / `SET|DROP NOT NULL` / `SET|DROP DEFAULT` / `COMMENT ON ... IS NULL` 清注释），**列顺序不可改**；类型比较要过别名归一（`character varying` = `varchar`），否则每次保存都白生成 ALTER；整批包在 BEGIN/COMMIT 里，失败必须 ROLLBACK（否则连接停在 25P02 报错状态）。新增 NOT NULL 且无默认值的列在 PG 会直接被拒，生成计划时就给出警告。
 
 ## 命令
 
 ```powershell
 npm run compile        # tsc 编译
-npm run test:smoke     # 83 项核心逻辑（纯 Node）
-npm run test:activate  # 66 项激活 + 表单 + 结果面板 + SQL Shell + 备份（mock vscode）
-npm test               # 编译 + 两项测试（2026-09-18 复核：83/66 全绿）
+npm run test:smoke     # 126 项核心逻辑（纯 Node）
+npm run test:activate  # 88 项激活 + 表单 + 结果面板 + SQL Shell + 备份 + 结构编辑（mock vscode）
+npm test               # 编译 + 两项测试（2026-09-30 复核：126/88 全绿）
+npm run test:live      # 真库联调 24 项（MySQL，凭据走环境变量，不进 npm test）
 npm run package        # 出 vsix
 ```
+
+- **改过 DDL 生成 / 结构编辑后必须跑 `npm run test:live`**：纯逻辑测试只能断言「语句长什么样」，服务端收不收只有它知道。脚本自建 `__dbviewer_probe_<时间戳>` 库、结束时 `DROP DATABASE`，用编译产物里的真实驱动跑「读结构 → 生成计划 → 执行 → 复读校验 → 失败路径 → 库属性」。它已经抓出三个只在真库暴露的问题（`ALTER DATABASE` 逗号、TEXT/JSON 默认值形态、`ON UPDATE` 被抹掉）。
+- 凭据：`$env:DBVIEWER_TEST_MYSQL_USER` / `_PASSWORD`（本机 MySQL 8.0.46，root）。
 
 ## 本机执行陷阱
 

@@ -18,16 +18,23 @@ import {
   ColumnNode,
   CreateDatabaseOptions,
   CreateUserRequest,
+  DatabaseChangeRequest,
   DatabaseError,
   DatabaseNode,
+  DatabaseObjectTarget,
+  DatabaseProperties,
   DriverCapabilities,
   DriverConnectOptions,
   DriverDefinition,
   ExecuteOptions,
   IDatabaseDriver,
+  ObjectChangePlan,
+  ObjectChangeResult,
   QueryResult,
   QueryTarget,
+  TableChangeRequest,
   TableNode,
+  TableStructure,
 } from '../core/types';
 
 export interface SidecarProxyOptions {
@@ -138,6 +145,54 @@ export class SidecarDriverProxy implements IDatabaseDriver {
       throw new DatabaseError(`驱动「${this.id}」不支持结果编辑`, 'ENOT_EDITABLE');
     }
     return this.call<CellUpdateResult>('updateCell', { request, options });
+  }
+
+  /**
+   * 表结构 / 库属性编辑同样转发到子进程。
+   *
+   * 传的是「目标状态」而不是拼好的 SQL：语句生成留在驱动内，两种进程模式下产出的
+   * DDL 才会逐字一致，也就不会出现「预览一种、执行另一种」。
+   */
+  async describeTable(target: QueryTarget & { table: string }): Promise<TableStructure> {
+    if (!this.capabilities.editTableStructure) {
+      throw new DatabaseError(`驱动「${this.id}」不支持编辑表结构`, 'ENOT_STRUCTURE');
+    }
+    return this.call<TableStructure>('describeTable', { target });
+  }
+
+  async planTableChange(request: TableChangeRequest): Promise<ObjectChangePlan> {
+    if (!this.capabilities.editTableStructure) {
+      throw new DatabaseError(`驱动「${this.id}」不支持编辑表结构`, 'ENOT_STRUCTURE');
+    }
+    return this.call<ObjectChangePlan>('planTableChange', { request });
+  }
+
+  async applyTableChange(request: TableChangeRequest): Promise<ObjectChangeResult> {
+    if (!this.capabilities.editTableStructure) {
+      throw new DatabaseError(`驱动「${this.id}」不支持编辑表结构`, 'ENOT_STRUCTURE');
+    }
+    return this.call<ObjectChangeResult>('applyTableChange', { request });
+  }
+
+  async describeDatabaseProperties(target: DatabaseObjectTarget): Promise<DatabaseProperties> {
+    if (!this.capabilities.editDatabaseProperties) {
+      throw new DatabaseError(`驱动「${this.id}」不支持编辑数据库属性`, 'ENOT_STRUCTURE');
+    }
+    return this.call<DatabaseProperties>('describeDatabaseProperties', { target });
+  }
+
+  async planDatabaseChange(request: DatabaseChangeRequest): Promise<ObjectChangePlan> {
+    if (!this.capabilities.editDatabaseProperties) {
+      throw new DatabaseError(`驱动「${this.id}」不支持编辑数据库属性`, 'ENOT_STRUCTURE');
+    }
+    return this.call<ObjectChangePlan>('planDatabaseChange', { request });
+  }
+
+  async applyDatabaseChange(request: DatabaseChangeRequest): Promise<ObjectChangeResult> {
+    if (!this.capabilities.editDatabaseProperties) {
+      throw new DatabaseError(`驱动「${this.id}」不支持编辑数据库属性`, 'ENOT_STRUCTURE');
+    }
+    return this.call<ObjectChangeResult>('applyDatabaseChange', { request });
   }
 
   async dropTable(target: QueryTarget & { table: string }): Promise<void> {

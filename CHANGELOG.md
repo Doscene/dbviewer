@@ -2,10 +2,43 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [未发布]
+
+### 新增
+
+- **右键编辑表结构**：表节点右键「编辑表结构…」打开编辑器面板，可增删列、改列名（重命名）、数据类型、可空、默认值、主键、自增、列注释，以及表名、存储引擎、字符集、排序规则、表注释。MySQL 额外支持上下移动调整列顺序。
+- **右键编辑数据库 / schema 属性**：数据库节点（MySQL）与 schema 节点（PostgreSQL）右键「编辑数据库属性…」，可改默认字符集、排序规则（MySQL）、属主、注释、名称（PostgreSQL）。
+- **先预览再落库**：面板上「生成 SQL」只生成语句并展示变更摘要与风险提示，「应用变更」才执行；危险变更复用 `dbviewer.confirmDestructiveStatements` 的 modal 二次确认，确认框里能直接看到完整语句。
+- **改动由驱动重新计算**：Webview 只回传「目标状态」，扩展侧在生成语句时让驱动重读一次当前结构。面板里的原始值仅用于渲染，因此长时间挂着的面板不会按过期结构下发 DDL。
+- **能力差异显式声明**：`DriverCapabilities` 新增 `editTableStructure` / `editDatabaseProperties`，驱动按需声明；`DriverRegistry.validate()` 会拦住「声明支持却没实现对应方法」的驱动。面板按驱动声明渲染（例如 PostgreSQL 不显示调序按钮与自增开关），并把各自的编辑限制直接列在界面上。
+- 新增 `core/objectEditor.ts`（纯 Node）：列 / 主键 / 属性的差异计算与提交前校验；新增 `drivers/mysqlStructure.ts` 与 `drivers/pgStructure.ts`：把差异渲染成各方言的 DDL（纯函数，可直接被测试断言）。
+- 新增 `views/objectEditorPanel.ts`、`media/objectEditor.js`、`media/objectEditor.css`。
+
+### 变更
+
+- 结构变更语句统一经 `driver.execute()` 下发，只读连接照样被驱动层拦下；MySQL 逐条执行并报告「第 N 条失败、前 M 条已生效」（DDL 无法回滚），PostgreSQL 整批包在事务里、失败自动 `ROLLBACK`。
+- Sidecar 模式同步支持：代理层与 sidecar host 增加 `describeTable` / `planTableChange` / `applyTableChange` / `describeDatabaseProperties` / `planDatabaseChange` / `applyDatabaseChange` 六个 RPC。
+- `package.json` 注册 `dbviewer.editTableStructure` / `dbviewer.editDatabaseProperties` 两条命令与表 / 库 / schema 节点的右键菜单（`3_modify` 分组），命令面板中隐藏。
+
+### 修复
+
+对着真实 MySQL 8.0.46 做完整联调（新增 `npm run test:live`）后修掉的三个问题，它们在纯逻辑测试里都不会暴露：
+
+- **`ALTER DATABASE` 不接受逗号分隔的多个选项**：同时改字符集与排序规则时生成的 `CHARACTER SET = a, COLLATE = b` 会被服务端判为语法错误，改为空格相连（`CHARACTER SET = a COLLATE = b`）。
+- **TEXT / BLOB / JSON 列的默认值必须是表达式形式**：裸写 `DEFAULT 'x'` 会被服务端拒绝（`BLOB, TEXT, GEOMETRY or JSON column can't have a default value`）。现在这几类列一律生成 `DEFAULT ('x')`；同时读回的值会先反转义再写回 —— `information_schema` 给出的表达式默认值形如 `_utf8mb4\'hello\'`（带字符集引导符且引号被转义），原样写回同样是语法错误。数字类型上手打的裸表达式（如 `3 * 7`）也补上括号。
+- **改写列定义时 `ON UPDATE CURRENT_TIMESTAMP` 被静默抹掉**：这类子句只存在于 `information_schema` 的 `EXTRA` 里，不体现在类型 / 默认值 / 可空任何一项上，改个注释就会把「时间戳自动更新」一起弄丢，而服务端不会报任何错。现在列定义带 `extraClauses` 原样往返（界面会把它标出来），缺失时按 `originalName` 从读回的现状继承。
+
+### 测试
+
+- 冒烟测试从 89 项扩展到 **126 项**：新增差异计算与校验（类型 / 默认值归一、改名不误判为删旧增新、列序判定、主键增删、属性差异、重名与超长名校验），以及两个方言的 DDL 生成（新增列的 `FIRST` / `AFTER`、默认值按类型补引号与表达式括号、TEXT / JSON 的表达式默认值形态与反转义、`ON UPDATE` 子句往返、`DROP PRIMARY KEY` 必须排在删列之前、PG 的 `USING` 转换与 `DROP DEFAULT` / `IS NULL`、类型别名等价不产生多余语句、库属性 `ALTER DATABASE` 不带 `DEFAULT` 也不带逗号、只改字符集时补默认排序规则）。
+- 激活测试从 72 项扩展到 **88 项**：右键菜单声明、无节点 / 未知连接不开面板、面板模型与引导数据、只读连接提示、`ready` / `preview` / `apply` 往返、用户取消算提示而非错误、生成失败与重读失败的错误回传、库属性模式不渲染列表格、单实例替换与回收。
+- 新增 `scripts/live-mysql-test.js`（`npm run test:live`，**不在 `npm test` 门禁内**）：对着真实 MySQL 建库建表，跑完「读结构 → 生成计划 → 执行 → 复读校验 → 失败路径 → 库属性」共 24 项断言，覆盖复合主键、列改名、增删列、调序、换引擎、`ON UPDATE` 与 `unsigned zerofill` / `enum` / `set` / `bit` / `binary` / `timestamp(3)` 的保真，结束时 `DROP DATABASE` 自清理。凭据只走环境变量。
+
 ## [0.6.0] - 2026-09-18
 
 ### 新增
 
+- **一张表一个结果窗口**：连接树里多选表 / 视图后右键「查看数据（前 N 行）」，每张表各开一个独立窗口，窗口标签就是「库名.表名」（PostgreSQL 用 schema）；不同表的结果不再互相覆盖，再次对同一张表「查看数据」则复用已有窗口并刷新。批量读取只弹一条可取消的进度，某张表失败只影响自己那个窗口，明细汇总到输出通道；跨连接的选中项各连各的（不像备份那样拒绝）。
 - **备份选中的数据表**：连接树支持多选（`canSelectMany`），在表 / 视图节点上右键「备份数据表…」即把选中对象导出到**同一个** SQL 文件。跨连接的选中项直接拒绝而不是拆成多个文件，同名表来自不同库 / schema 时按命名空间去重。
 - **备份整个数据库**：数据库节点（MySQL）/ schema 节点（PostgreSQL）/ 已连接的连接节点右键「备份数据库…」。整库入口先读一次对象列表，再走同一套备份流程。
 - **多种备份方式由驱动声明**：新增 `DriverDefinition.backupModes[]`，MySQL 与 PostgreSQL 各提供四种 —— 完整 SQL（结构 + 数据）、仅表结构、仅数据、原生 `mysqldump` / `pg_dump`。弹出列表按入口范围自动过滤（原生工具声明 `scope: 'database'`，因此不出现在表节点菜单里）；选中原生方式而 `dbviewer.allowExternalCommand` 未开启时，提示后可直接退回内置方式，不必重跑命令。
@@ -16,14 +49,15 @@
 
 ### 变更
 
+- **结果面板由单例改为按键注册表**：`ResultPanel.show(extensionUri, { key, title, preserveFocus })`，缺省键仍是共用的「查询结果」窗口（SQL 编辑器入口行为不变）；`ResultPanel.instance` 取当前焦点窗口，`dbviewer.exportResult` / `dbviewer.clearResult` 因此作用于用户正在看的那个窗口。新增 `core/tableTargets.ts`（纯 Node）负责多选目标的收集、去重与「库.表」标题 / 复用键的计算。
 - `package.json` 注册 `dbviewer.backupTables` / `dbviewer.backupDatabase` 两条命令与对应右键菜单（`6_backup` 分组），新增 `dbviewer.backupToolPaths` 配置项；`dbviewer.allowExternalCommand` 的说明补充了备份场景。
 - 驱动元数据新增 `backupModes` / `nativeBackup`，能力位新增 `capabilities.backup`；`DriverRegistry.validate()` 会拦住「声明支持备份却没实现 `backupChunks()`」的驱动。
 - 版本号提升至 `0.6.0`（**尚未打包发布**，0.5.0 仍在 Marketplace 验证队列中）。
 
 ### 测试
 
-- 冒烟测试从 52 项扩展到 **83 项**：新增字面量保真（大整数、二进制、日期、PG 数组）、备份方式元数据与范围过滤、多选目标收集（去重 / 跨连接拒绝）、文件名与文件头、原生工具参数展开（逐项替换、空字节拦截、ENOENT 提示）、分块状态机（结构 + 数据、keyset 与 OFFSET 分页、仅结构 / 仅数据、视图、单表失败跳过）、编排与取消（取消走 abort 而非 close）。
-- 激活测试从 64 项扩展到 **66 项**：备份两条命令纳入无参调用检查；mock 的 `withProgress` 补上真实的取消令牌参数并新增 `CancellationTokenSource` —— 此前 mock 只传进度对象，回调里访问 `token` 会抛 TypeError 并被自身的 try/catch 吞掉，测试反而「通过」。
+- 冒烟测试从 52 项扩展到 **89 项**：新增字面量保真（大整数、二进制、日期、PG 数组）、备份方式元数据与范围过滤、多选目标收集（去重 / 跨连接拒绝）、文件名与文件头、原生工具参数展开（逐项替换、空字节拦截、ENOENT 提示）、分块状态机（结构 + 数据、keyset 与 OFFSET 分页、仅结构 / 仅数据、视图、单表失败跳过）、编排与取消（取消走 abort 而非 close），以及「查看数据」多选目标收集（保序去重、跨库 / schema / 连接区分、非表节点过滤、「库.表」标题与复用键）。
+- 激活测试从 64 项扩展到 **72 项**：备份两条命令纳入无参调用检查；mock 的 `withProgress` 补上真实的取消令牌参数并新增 `CancellationTokenSource` —— 此前 mock 只传进度对象，回调里访问 `token` 会抛 TypeError 并被自身的 try/catch 吞掉，测试反而「通过」。本轮为多窗口补上 mock 面板的 `active` / `onDidChangeViewState` / `preserveFocus` 记录，新增同键复用、一表一窗互不覆盖、批量开窗不抢焦点、焦点窗口归属、关闭后同键重建五项断言。
 
 ## [0.5.0] - 2026-09-17
 

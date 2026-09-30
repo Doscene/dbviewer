@@ -15,6 +15,7 @@
 - **连接配置是单页表单** —— 所有字段一屏可见可改，切换数据库类型自动更新默认端口与专属参数，保存前可先测连接。
 - **查询执行顺手** —— `.sql` 文件按快捷键即跑，多语句自动拆分、逐条出结果、出错能定位到具体某条。
 - **结果不只是看** —— 可排序、可改 SQL 重跑、可双击改单元格（改完确认才落库）、可导出 CSV / Excel / JSON / JSONL。
+- **表结构也能改** —— 表节点右键「编辑表结构」即可增删列、改类型 / 默认值 / 主键 / 注释 / 自增；生成 SQL 先预览，确认后才落库。
 - **能备份** —— 多选数据表一次性导出，或右键整库 / 整个 schema 备份；走内置纯 SQL 导出，也可借力本机的 `mysqldump` / `pg_dump`。
 - **写操作有护栏** —— 危险语句执行前二次确认；只读连接从驱动层直接拒绝写操作。
 - **凭据不进配置文件** —— 密码存系统凭据存储（Windows DPAPI / WSL libsecret）。
@@ -39,7 +40,7 @@ code --install-extension doscene-cloud.dbviewer-dsc
 
 1. 左侧活动栏点击 **DBViewer** 图标 → 点标题栏的 `+`；
 2. 填写连接表单，点「测试连接」确认能通，再点「保存并连接」；
-3. 连上后即可：**展开节点**浏览库 / 表 / 列，**右键表**查看数据或建表语句，**右键连接**打开 SQL Shell 或新建查询。
+3. 连上后即可：**展开节点**浏览库 / 表 / 列，**右键表**查看数据、建表语句或**编辑表结构**（**Ctrl / Shift 多选**则每张表各开一个窗口，标签为「库.表」），**右键数据库 / schema** 编辑字符集、属主、注释，**右键连接**打开 SQL Shell 或新建查询。
 
 > 已保存的连接节点**点一下就连接**，不必先右键。
 
@@ -85,6 +86,7 @@ DBViewer 用**主机别名**抹平这件事 —— 主机栏填别名，插件�
 
 ## 结果面板
 
+- **一张表一个窗口**：表 / 视图节点右键「查看数据（前 N 行）」打开独立窗口，窗口标签就是「库名.表名」（PostgreSQL 用 schema）。多选若干张表则一次全部打开，各窗口结果互不覆盖；再次查看同一张表只刷新已有窗口，不会越开越多。SQL 编辑器里的临时查询仍然共用一个「查询结果」窗口，不会被表数据窗口顶掉。
 - **顶部是本次实际执行的 SQL**（含自动追加的 `LIMIT`）—— 可以直接改完按 `Ctrl+Enter` 重跑，也可以一键还原。
 - **下方浏览结果**：分页翻页、点击列头排序、单击单元格复制、一键复制整页为 TSV，多结果集用标签切换。
 - **双击单元格可改值**：改动先以橙色高亮挂起，工具栏显示「应用修改 (N)」，点它才真正写库，点「放弃」整体撤销 —— 手滑碰一下不会改坏线上数据。
@@ -126,13 +128,40 @@ Shell 走的是和结果面板完全一样的执行链路 —— 只读拦截、
 
 | 操作 | 入口 |
 |---|---|
-| 查看前 N 行数据 / 查看建表语句 / 生成查询语句 | 表节点右键 |
+| 查看前 N 行数据（可多选，一表一窗） / 查看建表语句 / 生成查询语句 | 表节点右键 |
+| 编辑表结构（列、主键、表属性） | 表节点右键 |
+| 编辑数据库 / schema 属性（字符集、排序规则、属主、注释） | 数据库节点（MySQL）、schema 节点（PostgreSQL）右键 |
 | 创建数据库（可选字符集、编码） | 已连接节点右键 |
 | 创建用户并授权（可加多条授权记录） | 已连接节点右键 |
 | 删除表 / 删除数据库 | 表节点、数据库节点右键 |
 | 切换数据库会话 | 已连接节点右键（PostgreSQL 需要） |
 
 删除表 / 库会先弹确认框再执行，执行后自动刷新树视图。
+
+## 编辑表结构与数据库属性
+
+表节点右键「编辑表结构…」，数据库 / schema 节点右键「编辑数据库属性…」，打开一个独立的编辑器面板：
+
+- **列定义表格**：增删列、改列名（重命名）、改数据类型、可空、默认值、主键、自增、注释，MySQL 还能拖动列顺序（↑ / ↓）。
+- **对象属性**：表的存储引擎、字符集、排序规则、表注释、表名；数据库 / schema 的默认字符集、排序规则、属主、注释、名称。
+- **先看再改**：点「生成 SQL」只生成语句并展示摘要与风险提示，不碰数据库；点「应用变更」才执行。
+- **改动由扩展侧重新计算**：面板里的原始值只用于渲染，生成语句时驱动会重读一次当前结构。面板开着放了很久也不会按过期结构下发 DDL。
+- **危险变更有二次确认**：`ALTER` / `RENAME` / `DROP` 走与 SQL 执行同一套确认开关（`dbviewer.confirmDestructiveStatements`），删列这类会丢数据的操作在确认框里能看到完整语句。
+
+不同数据库的能力差异直接在面板上说明，不靠试错：
+
+| | MySQL | PostgreSQL |
+|---|---|---|
+| 调整列顺序 | 支持（`FIRST` / `AFTER`） | 不支持，顺序改动会被忽略 |
+| 自增 | 任意列可切 `AUTO_INCREMENT` | 只有新列可写 `serial` / `bigserial`，既有列不给开关 |
+| 列注释 | `COMMENT` 随列定义走 | 独立的 `COMMENT ON COLUMN` |
+| 改列类型 | 按新类型转换，超长内容可能被截断 | 自动补 `USING 列::新类型`，转不了的值需要手工写表达式 |
+| 数据库注释 / 改名 | 都不支持 | 支持（改名会断开现有连接，界面只读展示） |
+| 事务性 | DDL 无法回滚，逐条执行并报告「第几条失败、前几条已生效」 | 整批包在一个事务里，失败整体回滚 |
+
+两边都只处理列、主键与表级属性；索引、外键、触发器、分区仍需写 SQL。只读连接可以打开面板查看结构，但提交按钮会被禁用。
+
+MySQL 的 `ON UPDATE CURRENT_TIMESTAMP` 这类子句会**原样保留并在界面上标出来**（它不属于类型 / 默认值 / 可空任何一项，漏掉就是静默改变表行为），但暂不支持在界面上修改或移除。TEXT / BLOB / JSON 列的默认值需要 MySQL 8.0.13 及以上（更早的版本不允许这几类列有默认值）。
 
 ## 备份
 
@@ -238,6 +267,8 @@ export class XxxDriver implements IDatabaseDriver {
     multiStatement: true,
     editable: false,  // 声明为 true 必须实现 updateCell()
     backup: false,    // 声明为 true 必须实现 backupChunks()
+    editTableStructure: false,     // 声明为 true 必须实现 describeTable / planTableChange / applyTableChange
+    editDatabaseProperties: false, // 声明为 true 必须实现 describeDatabaseProperties / planDatabaseChange / applyDatabaseChange
   };
   // connect / disconnect / isConnected / ping
   // listDatabases / listSchemas / listTables / listColumns / execute
@@ -246,13 +277,33 @@ export class XxxDriver implements IDatabaseDriver {
 
 `execute()` 只需处理单条语句，多语句拆分与结果汇总由公共框架完成。驱动 SDK 是**惰性加载**的 —— 只有在真正建立连接时才 `require`，因此「新建连接」下拉框不会额外加载数 MB 代码。
 
+结构编辑同样是「驱动生成语句、框架负责交互」：`describeTable()` 返回列定义与可编辑属性（`EditableProperty`，含类型、候选值、提示、是否可编辑），`planTableChange()` / `planDatabaseChange()` 负责算出**要执行哪些语句**（只生成不执行，面板据此预览），`apply*Change()` 才真正下发。差异计算与输入校验这类方言无关的部分在 `core/objectEditor.ts`，与数据库无关的 DDL 拼装建议放在独立的纯函数模块里（如 `drivers/mysqlStructure.ts`），这样冒烟测试能直接断言生成的语句。
+
 备份同理按数据声明：驱动在元数据里列出 `backupModes`（方式名、扩展名、是否含结构 / 数据、是否依赖外部命令、适用范围），命令层只负责把这份列表渲染成选项。原生工具的参数模板也写在元数据里（`nativeBackup`），占位符由框架替换、密码只走环境变量。
 
 第三方驱动也可以做成独立 npm 包，导出 `register(registry)` 即可接入，无需本插件发版。
 
+### 本地测试
+
+```powershell
+npm test               # 唯一门禁：tsc 编译 + 126 项纯逻辑冒烟 + 88 项激活测试（mock vscode）
+npm run test:live      # 可选：对着一台真实 MySQL 跑完整的「读结构 → 生成 SQL → 执行 → 复读校验」
+```
+
+`test:live` **不在门禁里**（需要真实数据库），但改过结构编辑 / DDL 生成后值得跑一次：它会真的建库建表、执行语句、再把结构读回来比对，结束时 `DROP DATABASE` 清理。它抓到过三个只有真库才会暴露的问题（`ALTER DATABASE` 不接受逗号分隔、TEXT / JSON 默认值必须写成表达式形式、改写别的属性时 `ON UPDATE CURRENT_TIMESTAMP` 被静默抹掉）。
+
+```powershell
+$env:DBVIEWER_TEST_MYSQL_USER='root'       # 可选 _HOST / _PORT
+$env:DBVIEWER_TEST_MYSQL_PASSWORD='…'
+npm run test:live
+```
+
 ## 已知限制
 
 - 多语句脚本依赖按分号自动拆分；MySQL 存储过程脚本若使用 `DELIMITER` 指令，会整体作为单条语句提交，此时脚本内多条语句需服务器支持（常规 DDL / DML 脚本不受影响）。
+- 结构编辑器只覆盖**列、主键与对象属性**：索引、外键、触发器、分区、视图定义都不在其中，仍需写 SQL。MySQL 的 DDL 无法回滚，一批变更中途失败时前面几条已经生效（面板会说明失败在第几条）；PostgreSQL 侧整批包在事务里，失败自动回滚。
+- 改列类型一律按「同一列的原地转换」处理，丢数据的转换（例如 `varchar` 改小、文本转数字）不会被拦截，请先备份或先在副本上试。
+- MySQL 的 `ON UPDATE CURRENT_TIMESTAMP`、`STORAGE` / `COLUMN_FORMAT` 这类写在 `EXTRA` 里的子句，界面只**原样保留** `ON UPDATE` 并在表格中标出，另外两类（只对压缩表 / NDB 有意义）不参与往返；这几项都还不能在界面上增删。
 - 内置备份按逐表 `SELECT` 导出，**不包含**索引、外键、触发器、存储过程与序列；需要完整结构请改用原生方式，或在命令行跑 `mysqldump` / `pg_dump`。生成的文件里也不含 `CREATE DATABASE` / `CREATE SCHEMA`，还原前需先建好库 / schema。
 - `__wsl_host__` 在 Windows 侧默认按 `127.0.0.1` 处理。若 WSL 的 localhost 转发被关闭，需手工填写 WSL 的真实 IP，或开启 `dbviewer.allowExternalCommand`（注意可能被安全策略拦截）。
 - SSL 暂不支持指定 CA 与客户端证书路径。

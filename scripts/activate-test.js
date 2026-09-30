@@ -217,6 +217,7 @@ const vscodeMock = {
       const received = [];
       const posted = [];
       let listener;
+      let viewStateListener;
       const panel = {
         viewType,
         title,
@@ -224,6 +225,10 @@ const vscodeMock = {
         iconPath: undefined,
         posted,
         received,
+        /** 是否聚焦：结果面板靠 onDidChangeViewState 跟踪「当前焦点窗口」。 */
+        active: false,
+        /** showOptions 原样留存，便于断言 preserveFocus。 */
+        viewColumn,
         webview: {
           html: '',
           cspSource: 'vscode-webview://test',
@@ -238,8 +243,24 @@ const vscodeMock = {
           },
         },
         onDidDispose: () => new Disposable(),
-        reveal: () => undefined,
+        onDidChangeViewState: (fn) => {
+          viewStateListener = fn;
+          return new Disposable();
+        },
+        reveal: (column, preserveFocus) => {
+          panel.viewColumn = column;
+          if (!preserveFocus) {
+            panel.setActive();
+          }
+        },
         dispose: () => undefined,
+        /** 测试专用：切换聚焦状态并触发视图状态回调。 */
+        setActive() {
+          panel.active = true;
+          if (viewStateListener) {
+            viewStateListener({ webviewPanel: panel });
+          }
+        },
         /** 测试专用：模拟 Webview 向扩展发消息，并等待扩展侧处理完成。 */
         async send(message) {
           received.push(message);
@@ -453,6 +474,8 @@ function makeContext() {
     'dbviewer.pickConnection',
     'dbviewer.backupTables',
     'dbviewer.backupDatabase',
+    'dbviewer.editTableStructure',
+    'dbviewer.editDatabaseProperties',
   ];
   for (const id of safeCommands) {
     await check(`${id} 空参调用不抛异常`, async () => {
@@ -464,6 +487,17 @@ function makeContext() {
 
   await check('无编辑器时 runQuery 不抛异常', async () => {
     await registeredCommands.get('dbviewer.runQuery')(undefined);
+  });
+
+  await check('多选查看数据：空参与非表节点都不开窗、不抛异常', async () => {
+    const handler = registeredCommands.get('dbviewer.showTableData');
+    webviewPanels.length = 0;
+    await handler(undefined, []);
+    await handler({ payload: { kind: 'column', profileId: 'p1', table: 't' } }, [
+      { payload: { kind: 'database', profileId: 'p1', database: 'app' } },
+      { payload: { kind: 'table' } },
+    ]);
+    assert.strictEqual(webviewPanels.length, 0, '非表节点不应开窗');
   });
 
   // ------------------------------------------------------------ 连接表单
@@ -953,6 +987,105 @@ function makeContext() {
     assert.strictEqual(writtenFiles.length, 0);
   });
 
+  // ------------------------------------------------------------ 多窗口
+
+  console.log('\n--- 多窗口（一表一窗）---');
+
+  // 复用键存在全局注册表里，上一个用例留下的同键面板会让「应新建」的断言假失败
+  // （或反过来假通过），所以每个用例开头都先清干净
+  ResultPanel.disposeAll();
+  webviewPanels.length = 0;
+
+  await check('表数据窗口：同键复用，标题为「库.表」', () => {
+    webviewPanels.length = 0;
+    const options = { key: 'table:p1|app||users', title: 'app.users' };
+    const first = ResultPanel.show(Uri.file(root), options);
+    const second = ResultPanel.show(Uri.file(root), options);
+    assert.strictEqual(webviewPanels.length, 1, '同键不应重复开窗');
+    assert.strictEqual(first, second, '同键应返回同一实例');
+    assert.strictEqual(webviewPanels[0].title, 'app.users', '窗口标签应为「库.表」');
+    assert.ok(
+      webviewPanels[0].webview.html.includes('<title>app.users</title>'),
+      'Webview <title> 未跟随面板标题',
+    );
+  });
+
+  await check('不同表各自一个窗口，结果互不覆盖', () => {
+    ResultPanel.disposeAll();
+    webviewPanels.length = 0;
+    const usersResult = {
+      sets: [
+        {
+          statement: 'SELECT',
+          sql: 'SELECT `id`, `name` FROM `app`.`users` LIMIT 1',
+          fields: ['id', 'name'],
+          rows: [{ id: 1, name: '张三' }],
+          rowCount: 1,
+        },
+      ],
+      durationMs: 3,
+      sql: 'SELECT * FROM `app`.`users`',
+      truncated: false,
+    };
+    const ordersResult = {
+      sets: [
+        {
+          statement: 'SELECT',
+          sql: 'SELECT `order_id` FROM `app`.`orders` LIMIT 1',
+          fields: ['order_id'],
+          rows: [{ order_id: 7 }],
+          rowCount: 1,
+        },
+      ],
+      durationMs: 4,
+      sql: 'SELECT * FROM `app`.`orders`',
+      truncated: false,
+    };
+
+    const users = ResultPanel.show(Uri.file(root), { key: 'table:p1|app||users', title: 'app.users' });
+    const orders = ResultPanel.show(Uri.file(root), { key: 'table:p1|app||orders', title: 'app.orders' });
+    assert.strictEqual(webviewPanels.length, 2, '不同表应各开一个窗口');
+    assert.deepStrictEqual(webviewPanels.map((p) => p.title), ['app.users', 'app.orders']);
+
+    users.update(usersResult, { connectionName: '本地 MySQL', target: 'app.users' });
+    orders.update(ordersResult, { connectionName: '本地 MySQL', target: 'app.orders' });
+
+    // 两个窗口各自持有结果：后更新的那个不会把前一个的结果顶掉
+    const usersView = webviewPanels[0];
+    const ordersView = webviewPanels[1];
+    assert.deepStrictEqual(usersView.posted.find((m) => m.type === 'result').sets[0].rows, [[1, '张三']]);
+    assert.deepStrictEqual(ordersView.posted.find((m) => m.type === 'result').sets[0].rows, [[7]]);
+    assert.strictEqual(users.result.sets[0].fields[0], 'id');
+    assert.strictEqual(orders.result.sets[0].fields[0], 'order_id');
+  });
+
+  await check('批量开窗：首个窗口获焦，其余 preserveFocus', () => {
+    webviewPanels.length = 0;
+    ResultPanel.show(Uri.file(root), { key: 'k-first', title: 'app.a' });
+    ResultPanel.show(Uri.file(root), { key: 'k-second', title: 'app.b', preserveFocus: true });
+    assert.strictEqual(typeof webviewPanels[0].viewColumn, 'number', '首个窗口应正常取焦');
+    assert.strictEqual(webviewPanels[1].viewColumn.preserveFocus, true, '后续窗口应以 preserveFocus 打开');
+  });
+
+  await check('导出 / 清空作用于当前焦点窗口', () => {
+    webviewPanels.length = 0;
+    const panelA = ResultPanel.show(Uri.file(root), { key: 'focus-a', title: 'app.a' });
+    const panelB = ResultPanel.show(Uri.file(root), { key: 'focus-b', title: 'app.b' });
+    webviewPanels[0].setActive();
+    assert.strictEqual(ResultPanel.instance, panelA, '焦点在 A 时应取 A');
+    webviewPanels[1].setActive();
+    assert.strictEqual(ResultPanel.instance, panelB, '焦点在 B 时应取 B');
+  });
+
+  await check('关闭后同键可重建，注册表同步清理', () => {
+    webviewPanels.length = 0;
+    const reopened = ResultPanel.show(Uri.file(root), { key: 'rebuild', title: 'app.users' });
+    reopened.dispose();
+    webviewPanels.length = 0;
+    ResultPanel.show(Uri.file(root), { key: 'rebuild', title: 'app.users' });
+    assert.strictEqual(webviewPanels.length, 1, '关闭后应能重新开窗');
+  });
+
   // ------------------------------------------------------------ SQL Shell
 
   console.log('\n--- SQL Shell ---');
@@ -1129,6 +1262,274 @@ function makeContext() {
     SqlShellPanel.open(Uri.file(root), 'profile-1', shellHost);
     assert.strictEqual(webviewPanels.length, 1, '面板关闭后应能重新创建');
     SqlShellPanel.disposeAll();
+  });
+
+  // ------------------------------------------------------------ 对象属性 / 表结构编辑器
+
+  console.log('\n--- 对象属性编辑器 ---');
+
+  const { ObjectEditorPanel } = require(path.join(outDir, 'views', 'objectEditorPanel.js'));
+
+  /** 造一个表结构模型，字段与驱动 `describeTable()` 的产出同形。 */
+  const tableModel = (over) =>
+    Object.assign(
+      {
+        mode: 'table',
+        title: 'app.users',
+        objectLabel: '数据表',
+        connectionLabel: '本地 MySQL · MySQL / MariaDB',
+        properties: [
+          { key: 'name', label: '表名', value: 'users', kind: 'text' },
+          { key: 'engine', label: '存储引擎', value: 'InnoDB', kind: 'select', options: ['InnoDB', 'MyISAM'] },
+          { key: 'comment', label: '表注释', value: '', kind: 'text' },
+        ],
+        columns: [
+          { name: 'id', dataType: 'int', nullable: false, defaultValue: null, comment: '主键', isPrimaryKey: true, autoIncrement: true },
+          { name: 'email', dataType: 'varchar(120)', nullable: false, defaultValue: null, comment: '', isPrimaryKey: false, autoIncrement: false },
+        ],
+        dataTypes: ['int', 'varchar(120)'],
+        allowReorder: true,
+        allowAutoIncrement: true,
+        limitations: ['索引、外键请用 SQL 修改。'],
+        ddl: 'CREATE TABLE `users` (\n  `id` int NOT NULL AUTO_INCREMENT\n);',
+        readOnly: false,
+      },
+      over || {},
+    );
+
+  const editorCalls = { planned: [], applied: [], loaded: 0 };
+  let applyOutcome;
+  let loadError;
+  let previewError;
+
+  /** 当前存活的面板：单实例编辑器每次 open 都会替换上一个，断言必须盯着最新的那个。 */
+  const liveView = () => webviewPanels[webviewPanels.length - 1];
+
+  const editorHost = {
+    load: async () => {
+      editorCalls.loaded += 1;
+      if (loadError) {
+        throw loadError;
+      }
+      return tableModel();
+    },
+    plan: async (change) => {
+      editorCalls.planned.push(change);
+      if (previewError) {
+        throw previewError;
+      }
+      return {
+        statements: ['ALTER TABLE `app`.`users`\n  ADD COLUMN `nick` varchar(64);'],
+        changes: ['新增列 nick'],
+        warnings: ['删除列会连同该列的数据一起丢弃，且无法回滚。'],
+      };
+    },
+    apply: async (change) => {
+      editorCalls.applied.push(change);
+      return applyOutcome;
+    },
+  };
+
+  const sampleChange = {
+    properties: { name: 'users', engine: 'MyISAM', comment: '会员表' },
+    columns: [{ name: 'id', originalName: 'id', dataType: 'int', nullable: false, isPrimaryKey: true, autoIncrement: true }],
+  };
+
+  webviewPanels.length = 0;
+  let editor = ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel(), { icon: 'table' });
+  const editorView = webviewPanels[webviewPanels.length - 1];
+
+  await check('右键菜单：表节点可编辑表结构，库 / schema 节点可编辑属性', () => {
+    const items = packageJson.contributes.menus['view/item/context'];
+    const tableItem = items.find((m) => m.command === 'dbviewer.editTableStructure');
+    assert.ok(tableItem, '未声明「编辑表结构」菜单');
+    assert.ok(tableItem.when.includes('view == dbviewer.connections'), tableItem.when);
+    assert.ok(tableItem.when.includes('viewItem == dbviewer.table'), `when 未限定表节点：${tableItem.when}`);
+    // 视图节点是 dbviewer.view，不该出现结构编辑入口
+    assert.ok(!/default\|table|view\|table/.test(tableItem.when), tableItem.when);
+
+    const dbItem = items.find((m) => m.command === 'dbviewer.editDatabaseProperties');
+    assert.ok(dbItem, '未声明「编辑数据库属性」菜单');
+    assert.ok(/viewItem =~ \/\^dbviewer\\?\.\(database\|schema\)\$\//.test(dbItem.when), `when 未匹配库 / schema 节点：${dbItem.when}`);
+  });
+
+  await check('编辑命令：无节点与未知连接都不开面板', async () => {
+    webviewPanels.length = 0;
+    await registeredCommands.get('dbviewer.editTableStructure')(undefined);
+    await registeredCommands.get('dbviewer.editTableStructure')({ payload: { table: 'users' } });
+    await registeredCommands.get('dbviewer.editDatabaseProperties')({ payload: { kind: 'database', database: 'app' } });
+    assert.strictEqual(webviewPanels.length, 0, '缺 profileId 时不该开面板');
+
+    // 有 profileId 但连接不存在：应在连接前就退出，而不是抛异常
+    await registeredCommands.get('dbviewer.editTableStructure')({
+      payload: { kind: 'table', profileId: 'not-exist', database: 'app', table: 'users' },
+    });
+    assert.strictEqual(webviewPanels.length, 0, '未知连接不该开面板');
+  });
+
+  await check('面板创建成功：标题为对象名，界面含属性区与列定义表格', () => {
+    assert.strictEqual(editorView.viewType, 'dbviewer.objectEditor');
+    assert.strictEqual(editorView.title, 'app.users');
+    const html = editorView.webview.html;
+    for (const id of ['properties', 'columnsCard', 'columns', 'sqlPreview', 'warnings', 'ddl', 'bootstrap']) {
+      assert.ok(html.includes(`id="${id}"`), `编辑器缺少 #${id}`);
+    }
+    assert.ok(html.includes('新增列'), '缺少新增列入口');
+    assert.ok(html.includes('应用变更'), '缺少应用入口');
+  });
+
+  await check('引导数据即模型：列定义、候选类型与限制一并下发', () => {
+    const matched = /<script type="application\/json" id="bootstrap">([\s\S]*?)<\/script>/.exec(editorView.webview.html);
+    assert.ok(matched, '未找到 bootstrap 数据块');
+    const data = JSON.parse(matched[1]);
+    assert.strictEqual(data.mode, 'table');
+    assert.strictEqual(data.columns.length, 2);
+    assert.strictEqual(data.columns[0].isPrimaryKey, true);
+    assert.deepStrictEqual(data.dataTypes, ['int', 'varchar(120)']);
+    assert.strictEqual(data.limitations.length, 1);
+    assert.ok(data.ddl.includes('CREATE TABLE'), '建表语句未随模型下发');
+  });
+
+  await check('只读连接：模型带 readOnly，界面给出提示', () => {
+    ObjectEditorPanel.disposeAll();
+    webviewPanels.length = 0;
+    ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel({ readOnly: true }));
+    const view = webviewPanels[webviewPanels.length - 1];
+    const matched = /<script type="application\/json" id="bootstrap">([\s\S]*?)<\/script>/.exec(view.webview.html);
+    assert.strictEqual(JSON.parse(matched[1]).readOnly, true);
+    assert.ok(/id="readOnlyBanner"[^>]*>\s*当前连接/.test(view.webview.html), '缺少只读提示');
+    assert.ok(!/id="readOnlyBanner" class="banner warn" hidden/.test(view.webview.html), '只读时提示不该被隐藏');
+    editor = ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel());
+  });
+
+  await check('ready 回发模型，供前端重建界面', async () => {
+    const view = liveView();
+    view.posted.length = 0;
+    await view.send({ type: 'ready' });
+    const message = view.posted.find((m) => m.type === 'model');
+    assert.ok(message, '未回发模型');
+    assert.strictEqual(message.model.title, 'app.users');
+  });
+
+  await check('生成 SQL：变更原样交给宿主，回传语句 / 摘要 / 警告', async () => {
+    const view = liveView();
+    editorCalls.planned.length = 0;
+    view.posted.length = 0;
+    await view.send({ type: 'preview', change: sampleChange });
+
+    assert.strictEqual(editorCalls.planned.length, 1, '变更未下发到宿主');
+    assert.deepStrictEqual(editorCalls.planned[0], sampleChange, '变更被改写');
+
+    const plan = view.posted.find((m) => m.type === 'plan');
+    assert.ok(plan, '未回传计划');
+    assert.ok(plan.plan.statements[0].includes('ADD COLUMN `nick`'));
+    assert.deepStrictEqual(plan.plan.changes, ['新增列 nick']);
+    assert.strictEqual(plan.plan.warnings.length, 1);
+    // 预览不执行
+    assert.strictEqual(editorCalls.applied.length, 0, '预览不应触发执行');
+    // busy 先置真后置假
+    const busy = view.posted.filter((m) => m.type === 'busy').map((m) => m.busy);
+    assert.deepStrictEqual(busy, [true, false]);
+  });
+
+  await check('应用变更：执行 → 重读模型 → 回传结果', async () => {
+    const view = liveView();
+    editorCalls.applied.length = 0;
+    editorCalls.loaded = 0;
+    view.posted.length = 0;
+    applyOutcome = {
+      statements: ['ALTER TABLE `app`.`users`\n  ADD COLUMN `nick` varchar(64);'],
+      changes: ['新增列 nick'],
+      executed: 1,
+    };
+
+    await view.send({ type: 'apply', change: sampleChange });
+
+    assert.deepStrictEqual(editorCalls.applied[0], sampleChange);
+    const applied = view.posted.find((m) => m.type === 'applied');
+    assert.ok(applied, '未回传执行结果');
+    assert.strictEqual(applied.result.executed, 1);
+    // 结构变了之后面板上的旧状态必须失效，因此执行完要重读一次模型
+    assert.strictEqual(editorCalls.loaded, 1, '应用成功后未重读模型');
+    assert.ok(view.posted.some((m) => m.type === 'model'), '未用新模型刷新面板');
+  });
+
+  await check('用户取消（宿主返回 undefined）算提示而不是错误', async () => {
+    const view = liveView();
+    view.posted.length = 0;
+    applyOutcome = undefined;
+    await view.send({ type: 'apply', change: sampleChange });
+    assert.ok(!view.posted.some((m) => m.type === 'error'), '取消不该报错');
+    const notice = view.posted.find((m) => m.type === 'notice');
+    assert.ok(notice && notice.message.includes('取消'), '缺少取消提示');
+  });
+
+  await check('生成失败：错误文本回传到结果区，且 busy 复位', async () => {
+    const view = liveView();
+    view.posted.length = 0;
+    previewError = new Error("Duplicate column name 'nick'");
+    await view.send({ type: 'preview', change: sampleChange });
+    const error = view.posted.find((m) => m.type === 'error');
+    assert.ok(error, '未回传错误');
+    assert.ok(error.message.includes('Duplicate column'), error.message);
+    assert.strictEqual(view.posted[view.posted.length - 1].type, 'busy', 'busy 未复位');
+    assert.strictEqual(view.posted[view.posted.length - 1].busy, false);
+    previewError = undefined;
+  });
+
+  await check('重读模型失败：报错但不把已完成的执行结果吞掉', async () => {
+    const view = liveView();
+    view.posted.length = 0;
+    applyOutcome = { statements: [], changes: [], executed: 0 };
+    loadError = new Error('连接已断开');
+    await view.send({ type: 'apply', change: sampleChange });
+    assert.ok(view.posted.some((m) => m.type === 'error'), '重读失败未提示');
+    assert.ok(view.posted.some((m) => m.type === 'applied'), '执行结果不该因为重读失败而丢失');
+    loadError = undefined;
+  });
+
+  await check('库属性模式：不渲染列定义表格', () => {
+    ObjectEditorPanel.disposeAll();
+    webviewPanels.length = 0;
+    ObjectEditorPanel.open(
+      Uri.file(root),
+      editorHost,
+      tableModel({
+        mode: 'database',
+        title: 'app',
+        objectLabel: '数据库',
+        properties: [
+          { key: 'name', label: '数据库名', value: 'app', kind: 'text', editable: false },
+          { key: 'charset', label: '默认字符集', value: 'utf8mb4', kind: 'select', options: ['utf8mb4', 'latin1'] },
+        ],
+        columns: undefined,
+        limitations: ['MySQL 不支持数据库注释。'],
+      }),
+    );
+    const view = webviewPanels[webviewPanels.length - 1];
+    assert.ok(view.webview.html.includes('id="columnsCard" hidden'), '库属性面板不该出现列定义表格');
+    assert.ok(/id="bootstrap"[^>]*>/.test(view.webview.html));
+    editor = ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel());
+  });
+
+  await check('单实例：重复打开替换旧面板，disposeAll 全部回收', () => {
+    webviewPanels.length = 0;
+    const first = ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel());
+    assert.strictEqual(ObjectEditorPanel.instance, first);
+    ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel());
+    assert.strictEqual(webviewPanels.length, 2, '第二次打开应新建面板（旧面板由 dispose 关闭）');
+    assert.ok(webviewPanels[0].webview.html.length > 0);
+    ObjectEditorPanel.disposeAll();
+    assert.strictEqual(ObjectEditorPanel.instance, undefined);
+  });
+
+  await check('取消关闭面板', async () => {
+    webviewPanels.length = 0;
+    const panel = ObjectEditorPanel.open(Uri.file(root), editorHost, tableModel());
+    await webviewPanels[webviewPanels.length - 1].send({ type: 'cancel' });
+    assert.strictEqual(ObjectEditorPanel.instance, undefined, '取消后面板应释放');
+    assert.ok(panel);
+    ObjectEditorPanel.disposeAll();
   });
 
   await check('deactivate() 无异常', async () => {

@@ -11,6 +11,12 @@ import * as mysql from 'mysql2/promise';
 import { MYSQL_DEFINITION } from './definitions';
 import { MysqlBackupSession } from './mysqlBackup';
 import { runBackupChunks } from './backupCore';
+import {
+  buildMysqlDatabasePlan,
+  buildMysqlTablePlan,
+  inheritMysqlExtraClauses,
+  MYSQL_COLUMN_TYPES,
+} from './mysqlStructure';
 import { buildResultSet, executeScript } from './support';
 import {
   BackupChunk,
@@ -20,16 +26,25 @@ import {
   ColumnNode,
   CreateDatabaseOptions,
   CreateUserRequest,
+  DatabaseChangeRequest,
   DatabaseError,
   DatabaseNode,
+  DatabaseObjectTarget,
+  DatabaseProperties,
   DriverCapabilities,
   DriverConnectOptions,
+  EditableProperty,
   ExecuteOptions,
   IDatabaseDriver,
+  ObjectChangePlan,
+  ObjectChangeResult,
   QueryResult,
   QueryTarget,
   ResultSet,
+  TableChangeRequest,
+  TableColumnDefinition,
   TableNode,
+  TableStructure,
 } from '../core/types';
 import { mysqlQualified, quoteMysqlIdent, quoteMysqlString, sanitizeRow, toSqlLiteral } from '../core/sqlText';
 
@@ -305,6 +320,226 @@ export class MySqlDriver implements IDatabaseDriver {
     return `UPDATE ${qualified} SET ${setClause} WHERE ${whereClause};`;
   }
 
+  // ---------------------------------------------------------------- 表结构与对象属性
+
+  /**
+   * 读取表结构。
+   *
+   * 列信息来自 `information_schema.COLUMNS` 而不是 `SHOW COLUMNS`：前者能一次拿到
+   * 类型全称（含 unsigned / 长度）、默认值、注释与主键标记，省掉多轮往返。
+   */
+  async describeTable(target: QueryTarget & { table: string }): Promise<TableStructure> {
+    const database = target.database ?? this.defaultDatabase;
+    if (!database) {
+      throw new DatabaseError('未指定数据库，无法读取表结构', 'ENO_DATABASE');
+    }
+    const rows = await this.rawQuery<{
+      COLUMN_NAME: string;
+      COLUMN_TYPE: string;
+      IS_NULLABLE: string;
+      COLUMN_DEFAULT: string | null;
+      EXTRA: string | null;
+      COLUMN_KEY: string;
+      COLUMN_COMMENT: string | null;
+    }>(
+      `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_KEY, COLUMN_COMMENT
+         FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION`,
+      [database, target.table],
+    );
+    if (rows.length === 0) {
+      throw new DatabaseError(`表不存在或无权访问：${database}.${target.table}`, 'ENO_TABLE');
+    }
+
+    const [meta] = await this.rawQuery<{
+      ENGINE: string | null;
+      TABLE_COLLATION: string | null;
+      TABLE_COMMENT: string | null;
+    }>(
+      `SELECT ENGINE, TABLE_COLLATION, TABLE_COMMENT
+         FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+      [database, target.table],
+    );
+
+    const collation = meta?.TABLE_COLLATION ?? '';
+    // 排序规则名恒以字符集名开头（utf8mb4_unicode_ci → utf8mb4），无需再查一次
+    const charset = collation ? collation.split('_')[0] : '';
+    const engines = (await this.rawQuery<{ Engine: string; Support: string }>('SHOW ENGINES'))
+      .filter((row) => /^(YES|DEFAULT)$/i.test(row.Support ?? ''))
+      .map((row) => row.Engine);
+    const charsets = (await this.rawQuery<{ Charset: string }>('SHOW CHARACTER SET')).map((row) => row.Charset);
+    const collations = (await this.rawQuery<{ Collation: string }>('SHOW COLLATION')).map((row) => row.Collation);
+
+    const columns: TableColumnDefinition[] = rows.map((row, index) => ({
+      name: row.COLUMN_NAME,
+      originalName: row.COLUMN_NAME,
+      dataType: row.COLUMN_TYPE,
+      nullable: row.IS_NULLABLE === 'YES',
+      defaultValue: row.COLUMN_DEFAULT,
+      comment: row.COLUMN_COMMENT || undefined,
+      isPrimaryKey: row.COLUMN_KEY === 'PRI',
+      autoIncrement: /auto_increment/i.test(row.EXTRA ?? ''),
+      // `ON UPDATE CURRENT_TIMESTAMP` 只出现在 EXTRA 里，带上它才不会在改写别的属性时被静默抹掉
+      extraClauses: mysqlExtraClauses(row.EXTRA),
+      ordinal: index + 1,
+    }));
+
+    const properties: EditableProperty[] = [
+      {
+        key: 'name',
+        label: '表名',
+        value: target.table,
+        kind: 'text',
+        hint: '改名使用 RENAME TABLE，不影响数据',
+      },
+      {
+        key: 'engine',
+        label: '存储引擎',
+        value: meta?.ENGINE ?? '',
+        kind: 'select',
+        options: engines,
+        hint: 'MyISAM 不支持事务；改引擎会重建表',
+      },
+      { key: 'charset', label: '字符集', value: charset, kind: 'select', options: charsets },
+      {
+        key: 'collation',
+        label: '排序规则',
+        value: collation,
+        kind: 'select',
+        options: collations,
+        hint: '需与字符集匹配，仅改字符集时自动取该字符集的默认排序规则',
+      },
+      { key: 'comment', label: '表注释', value: meta?.TABLE_COMMENT ?? '', kind: 'text' },
+    ];
+
+    return {
+      target: { database, table: target.table },
+      columns,
+      properties,
+      dataTypes: [...MYSQL_COLUMN_TYPES],
+      limitations: [
+        '本编辑器只处理列、主键与表级属性；索引、外键、触发器、分区请用 SQL 修改。',
+        '改列类型时 MySQL 会按新类型转换既有数据，超长内容可能被截断，建议先在副本上试。',
+      ],
+      allowReorder: true,
+      allowAutoIncrement: true,
+      ddl: await this.showCreateTable({ database, table: target.table }).catch(() => undefined),
+    };
+  }
+
+  /**
+   * 生成表结构变更计划。
+   *
+   * 语句怎么拼全在 `mysqlStructure.ts` 的纯函数里：它不碰连接，因此能被冒烟测试
+   * 直接断言生成的 DDL —— 这里只负责把「现状」读出来喂给它。
+   */
+  async planTableChange(request: TableChangeRequest): Promise<ObjectChangePlan> {
+    const current = await this.describeTable(request.target);
+    return buildMysqlTablePlan(current, inheritMysqlExtraClauses(current, request), {
+      defaultCollationOf: (charset) => this.defaultCollationOf(charset),
+    });
+  }
+
+  /**
+   * 应用表结构变更。
+   *
+   * 逐条执行而不是合成一个脚本：MySQL 的 DDL 无法整体回滚，逐条执行才能准确报出
+   * 「第几条失败、前几条已经生效」，用户据此判断接下来该手工补什么。
+   */
+  async applyTableChange(request: TableChangeRequest): Promise<ObjectChangeResult> {
+    return this.executePlan(await this.planTableChange(request));
+  }
+
+  async describeDatabaseProperties(target: DatabaseObjectTarget): Promise<DatabaseProperties> {
+    const [row] = await this.rawQuery<{ DEFAULT_CHARACTER_SET_NAME: string; DEFAULT_COLLATION_NAME: string }>(
+      `SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
+         FROM information_schema.SCHEMATA
+        WHERE SCHEMA_NAME = ?`,
+      [target.name],
+    );
+    if (!row) {
+      throw new DatabaseError(`数据库不存在或无权访问：${target.name}`, 'ENO_DATABASE');
+    }
+    const charsets = (await this.rawQuery<{ Charset: string }>('SHOW CHARACTER SET')).map((item) => item.Charset);
+    const collations = (await this.rawQuery<{ Collation: string }>('SHOW COLLATION')).map((item) => item.Collation);
+
+    return {
+      target,
+      label: '数据库',
+      properties: [
+        {
+          key: 'name',
+          label: '数据库名',
+          value: target.name,
+          kind: 'text',
+          editable: false,
+          hint: 'MySQL 不支持重命名数据库',
+        },
+        {
+          key: 'charset',
+          label: '默认字符集',
+          value: row.DEFAULT_CHARACTER_SET_NAME,
+          kind: 'select',
+          options: charsets,
+          hint: '只影响之后新建的表；已有表要逐表修改',
+        },
+        {
+          key: 'collation',
+          label: '默认排序规则',
+          value: row.DEFAULT_COLLATION_NAME,
+          kind: 'select',
+          options: collations,
+          hint: '需与默认字符集匹配',
+        },
+      ],
+      limitations: ['MySQL 不支持数据库注释，也不支持在线重命名数据库（需另行导出导入）。'],
+    };
+  }
+
+  async planDatabaseChange(request: DatabaseChangeRequest): Promise<ObjectChangePlan> {
+    const current = await this.describeDatabaseProperties(request.target);
+    return buildMysqlDatabasePlan(current, request, {
+      defaultCollationOf: (charset) => this.defaultCollationOf(charset),
+    });
+  }
+
+  async applyDatabaseChange(request: DatabaseChangeRequest): Promise<ObjectChangeResult> {
+    return this.executePlan(await this.planDatabaseChange(request));
+  }
+
+  /** 逐条执行变更语句，失败时说明「第几条挂了、前几条已生效」。 */
+  private async executePlan(plan: ObjectChangePlan): Promise<ObjectChangeResult> {
+    let executed = 0;
+    for (const statement of plan.statements) {
+      try {
+        await this.execute(statement, { limit: 0, timeoutMs: this.queryTimeoutMs });
+      } catch (err) {
+        const detail = err instanceof DatabaseError ? err.detail : undefined;
+        const code = err instanceof DatabaseError ? err.code : undefined;
+        throw new DatabaseError(
+          `第 ${executed + 1} 条语句执行失败（共 ${plan.statements.length} 条，前 ${executed} 条已生效）：${
+            (err as Error).message
+          }`,
+          code,
+          detail,
+        );
+      }
+      executed += 1;
+    }
+    return { ...plan, executed };
+  }
+
+  /** 查字符集的默认排序规则；只改字符集时用它补齐 COLLATE，避免服务端报不兼容。 */
+  private async defaultCollationOf(charset: string): Promise<string | undefined> {
+    if (!charset) {
+      return undefined;
+    }
+    const rows = await this.rawQuery<Record<string, string>>(`SHOW CHARACTER SET LIKE ${quoteMysqlString(charset)}`);
+    return rows[0]?.['Default collation'] || undefined;
+  }
+
   // ---------------------------------------------------------------- 备份
 
   /**
@@ -474,6 +709,19 @@ function assertReadOnly(sql: string): void {
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
+}
+
+/**
+ * 从 `information_schema.COLUMNS.EXTRA` 里挑出必须原样保留的列子句。
+ *
+ * 只有 `ON UPDATE …` 会被漏掉：它在 EXTRA 里自成一段（如
+ * `DEFAULT_GENERATED on update CURRENT_TIMESTAMP`），而 `auto_increment` 已由
+ * `autoIncrement` 字段单独表达。EXTRA 剩下的取值（`STORAGE DISK/MEMORY`、
+ * `COLUMN_FORMAT …`）只对 NDB / 压缩表有意义，暂不处理。
+ */
+function mysqlExtraClauses(extra: string | null | undefined): string | undefined {
+  const match = /(?:^|\s)on update\s+(.+)$/i.exec(extra ?? '');
+  return match ? `ON UPDATE ${match[1].trim()}` : undefined;
 }
 
 /** 生成 MySQL 用户账号字面量 `'user'@'host'`。 */

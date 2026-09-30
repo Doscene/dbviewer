@@ -15,6 +15,7 @@ import { Client, ClientConfig } from 'pg';
 import { PG_DEFINITION } from './definitions';
 import { PG_BACKUP_TYPE_PARSERS, PgBackupSession } from './pgBackup';
 import { runBackupChunks } from './backupCore';
+import { buildPgDatabasePlan, buildPgTablePlan, PG_COLUMN_TYPES } from './pgStructure';
 import { buildResultSet, executeScript } from './support';
 import { pgQualified, quotePgIdent, quotePgString, sanitizeValue, toSqlLiteral, withTimeout } from '../core/sqlText';
 import {
@@ -26,16 +27,25 @@ import {
   ColumnNode,
   CreateDatabaseOptions,
   CreateUserRequest,
+  DatabaseChangeRequest,
   DatabaseError,
   DatabaseNode,
+  DatabaseObjectTarget,
+  DatabaseProperties,
   DriverCapabilities,
   DriverConnectOptions,
+  EditableProperty,
   ExecuteOptions,
   IDatabaseDriver,
+  ObjectChangePlan,
+  ObjectChangeResult,
   QueryResult,
   QueryTarget,
   ResultSet,
+  TableChangeRequest,
+  TableColumnDefinition,
   TableNode,
+  TableStructure,
 } from '../core/types';
 
 const SYSTEM_DATABASES = new Set(['postgres', 'template0', 'template1']);
@@ -262,7 +272,7 @@ export class PostgresDriver implements IDatabaseDriver {
     );
 
     const lines = columns.map((col) => {
-      let line = `    ${quoteIdent(col.name)} ${col.data_type}`;
+      let line = `    ${quotePgIdent(col.name)} ${col.data_type}`;
       if (col.default_value) {
         line += ` DEFAULT ${col.default_value}`;
       }
@@ -282,6 +292,241 @@ export class PostgresDriver implements IDatabaseDriver {
       lines.join(',\n'),
       ');',
     ].join('\n');
+  }
+
+  // ---------------------------------------------------------------- 表结构与对象属性
+
+  /**
+   * 读取表结构。
+   *
+   * 与 `showCreateTable` 的区别是「为了改而读」：这里额外取注释、自增序列与主键标记，
+   * 且列顺序严格按 `attnum` —— 目标状态要靠它做差异比较。
+   */
+  async describeTable(target: QueryTarget & { table: string }): Promise<TableStructure> {
+    const schema = target.schema ?? 'public';
+    const rows = await this.rawQuery<{
+      name: string;
+      data_type: string;
+      nullable: boolean;
+      default_value: string | null;
+      comment: string | null;
+      identity: string | null;
+      serial_sequence: string | null;
+      is_primary_key: boolean;
+    }>(
+      `SELECT a.attname                                        AS name,
+              format_type(a.atttypid, a.atttypmod)             AS data_type,
+              NOT a.attnotnull                                 AS nullable,
+              pg_get_expr(ad.adbin, ad.adrelid)                AS default_value,
+              col_description(c.oid, a.attnum)                 AS comment,
+              a.attidentity                                    AS identity,
+              pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname) AS serial_sequence,
+              EXISTS (
+                SELECT 1 FROM pg_constraint con
+                 WHERE con.conrelid = a.attrelid
+                   AND con.contype = 'p'
+                   AND a.attnum = ANY (con.conkey)
+              )                                                AS is_primary_key
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+        WHERE a.attnum > 0
+          AND NOT a.attisdropped
+          AND n.nspname = $1
+          AND c.relname = $2
+        ORDER BY a.attnum`,
+      [schema, target.table],
+    );
+    if (rows.length === 0) {
+      throw new DatabaseError(`表不存在或无权访问：${schema}.${target.table}`, 'ENO_TABLE');
+    }
+
+    const [meta] = await this.rawQuery<{ comment: string | null; owner: string }>(
+      `SELECT obj_description(c.oid, 'pg_class') AS comment, pg_get_userbyid(c.relowner) AS owner
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2`,
+      [schema, target.table],
+    );
+    const roles = await this.listRoles();
+
+    const columns: TableColumnDefinition[] = rows.map((row, index) => ({
+      name: row.name,
+      originalName: row.name,
+      dataType: row.data_type,
+      nullable: !!row.nullable,
+      defaultValue: row.default_value,
+      comment: row.comment ?? undefined,
+      isPrimaryKey: !!row.is_primary_key,
+      // serial 与 identity 都表现为「服务端自己产生下一个值」，界面上统一成自增
+      autoIncrement: !!row.serial_sequence || !!row.identity,
+      ordinal: index + 1,
+    }));
+
+    const properties: EditableProperty[] = [
+      { key: 'name', label: '表名', value: target.table, kind: 'text', hint: '改名使用 RENAME，不影响数据' },
+      { key: 'owner', label: '属主', value: meta?.owner ?? '', kind: 'select', options: roles },
+      { key: 'comment', label: '表注释', value: meta?.comment ?? '', kind: 'text' },
+    ];
+
+    return {
+      target: { database: target.database, schema, table: target.table },
+      columns,
+      properties,
+      dataTypes: [...PG_COLUMN_TYPES],
+      limitations: [
+        'PostgreSQL 不支持调整列顺序（列序由物理位置决定），顺序改动会被忽略。',
+        '自增请在新列上直接写 serial / bigserial；既有列无法就地改成自增。',
+        '改列类型时框架会补 `USING 列::新类型`；无法强转的数据需要手工写转换表达式。',
+        '本编辑器只处理列、主键与表级属性；索引、外键、触发器请用 SQL 修改。',
+      ],
+      allowReorder: false,
+      // 既有列不能就地转自增（要新建序列 + OWNED BY + SET DEFAULT），界面上直接不给这个开关
+      allowAutoIncrement: false,
+      ddl: await this.showCreateTable({ database: target.database, schema, table: target.table }).catch(() => undefined),
+    };
+  }
+
+  /**
+   * 生成表结构变更计划。
+   *
+   * 语句怎么拼全在 `pgStructure.ts` 的纯函数里：不碰连接，冒烟测试可以直接断言 DDL。
+   */
+  async planTableChange(request: TableChangeRequest): Promise<ObjectChangePlan> {
+    const current = await this.describeTable(request.target);
+    return buildPgTablePlan(current, request, {
+      primaryKeyConstraint: (schema, table) => this.primaryKeyConstraint(schema, table),
+    });
+  }
+  async applyTableChange(request: TableChangeRequest): Promise<ObjectChangeResult> {
+    return this.executePlan(await this.planTableChange(request));
+  }
+
+  async describeDatabaseProperties(target: DatabaseObjectTarget): Promise<DatabaseProperties> {
+    const roles = await this.listRoles();
+
+    if (target.kind === 'schema') {
+      const [row] = await this.rawQuery<{ owner: string; comment: string | null }>(
+        `SELECT pg_get_userbyid(n.nspowner) AS owner, obj_description(n.oid, 'pg_namespace') AS comment
+           FROM pg_namespace n
+          WHERE n.nspname = $1`,
+        [target.name],
+      );
+      if (!row) {
+        throw new DatabaseError(`schema 不存在或无权访问：${target.name}`, 'ENO_SCHEMA');
+      }
+      return {
+        target,
+        label: 'Schema',
+        properties: [
+          { key: 'name', label: 'Schema 名', value: target.name, kind: 'text', hint: '改名后树视图中的节点会随之变化' },
+          { key: 'owner', label: '属主', value: row.owner ?? '', kind: 'select', options: roles },
+          { key: 'comment', label: '注释', value: row.comment ?? '', kind: 'text' },
+        ],
+        limitations: ['改属主需要当前角色有权限，或本身就是该 schema 的属主。'],
+      };
+    }
+
+    const [row] = await this.rawQuery<{
+      owner: string;
+      comment: string | null;
+      encoding: string;
+      collate: string;
+    }>(
+      `SELECT pg_get_userbyid(d.datdba) AS owner,
+              obj_description(d.oid, 'pg_database') AS comment,
+              pg_encoding_to_char(d.encoding) AS encoding,
+              d.datcollate AS collate
+         FROM pg_database d
+        WHERE d.datname = $1`,
+      [target.name],
+    );
+    if (!row) {
+      throw new DatabaseError(`数据库不存在：${target.name}`, 'ENO_DATABASE');
+    }
+    return {
+      target,
+      label: '数据库',
+      properties: [
+        {
+          key: 'name',
+          label: '数据库名',
+          value: target.name,
+          kind: 'text',
+          editable: false,
+          hint: '改名会断开现有连接，请手工执行 ALTER DATABASE ... RENAME TO',
+        },
+        { key: 'encoding', label: '编码', value: row.encoding, kind: 'text', editable: false, hint: '创建后不可更改' },
+        { key: 'collate', label: '排序规则', value: row.collate, kind: 'text', editable: false, hint: '创建后不可更改' },
+        { key: 'owner', label: '属主', value: row.owner ?? '', kind: 'select', options: roles },
+        { key: 'comment', label: '注释', value: row.comment ?? '', kind: 'text' },
+      ],
+      limitations: ['数据库的编码与排序规则在创建时确定，不能在线修改。'],
+    };
+  }
+
+  async planDatabaseChange(request: DatabaseChangeRequest): Promise<ObjectChangePlan> {
+    const current = await this.describeDatabaseProperties(request.target);
+    return buildPgDatabasePlan(current, request);
+  }
+
+  async applyDatabaseChange(request: DatabaseChangeRequest): Promise<ObjectChangeResult> {
+    return this.executePlan(await this.planDatabaseChange(request));
+  }
+
+  /**
+   * 逐条执行变更语句，整体包在一个事务里。
+   *
+   * PostgreSQL 的 DDL 支持事务，因此这里刻意做得比 MySQL 侧更强：中途任何一条失败
+   * 就整体回滚，不会留下「改了一半」的表结构。失败后必须 ROLLBACK —— 处在已中止的
+   * 事务里，这条连接上的后续查询会全部报 25P02，那会把整个插件都用不了。
+   */
+  private async executePlan(plan: ObjectChangePlan): Promise<ObjectChangeResult> {
+    if (plan.statements.length === 0) {
+      return { ...plan, executed: 0 };
+    }
+    const options = { limit: 0, timeoutMs: this.queryTimeoutMs };
+    await this.execute('BEGIN;', options);
+    let executed = 0;
+    try {
+      for (const statement of plan.statements) {
+        await this.execute(statement, options);
+        executed += 1;
+      }
+      await this.execute('COMMIT;', options);
+    } catch (err) {
+      try {
+        await this.execute('ROLLBACK;', options);
+      } catch {
+        /* 连接可能已经不可用，回滚失败不再掩盖原始错误 */
+      }
+      const detail = err instanceof DatabaseError ? err.detail : undefined;
+      const code = err instanceof DatabaseError ? err.code : undefined;
+      throw new DatabaseError(
+        `结构变更失败，已整体回滚（第 ${executed + 1} 条，共 ${plan.statements.length} 条）：${(err as Error).message}`,
+        code,
+        detail,
+      );
+    }
+    return { ...plan, executed };
+  }
+
+  private async listRoles(): Promise<string[]> {
+    const rows = await this.rawQuery<{ rolname: string }>('SELECT rolname FROM pg_roles ORDER BY rolname');
+    return rows.map((row) => row.rolname);
+  }
+
+  private async primaryKeyConstraint(schema: string, table: string): Promise<string | undefined> {
+    const rows = await this.rawQuery<{ conname: string }>(
+      `SELECT con.conname
+         FROM pg_constraint con
+         JOIN pg_class c ON c.oid = con.conrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'p'`,
+      [schema, table],
+    );
+    return rows[0]?.conname;
   }
 
   // ---------------------------------------------------------------- 备份
@@ -560,9 +805,6 @@ export function uniquifyNames(names: string[]): string[] {
   });
 }
 
-function quoteIdent(name: string): string {
-  return `"${name.replace(/"/g, '""')}"`;
-}
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;

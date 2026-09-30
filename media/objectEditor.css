@@ -1,0 +1,391 @@
+/* 对象属性 / 表结构编辑器样式：全部基于 VS Code 主题变量，自动适配浅色与深色主题。 */
+
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Webview 里 hidden 属性会被部分组件的 display 规则压掉，必须显式兜底 */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* ---------------------------------------------------------------- 页头 / 页脚 */
+
+.page-head {
+  padding: 16px 20px 8px;
+  flex: 0 0 auto;
+}
+
+.page-head h1 {
+  margin: 0 0 4px;
+  font-size: 1.4em;
+  font-weight: 600;
+}
+
+.page-head .env {
+  margin: 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+}
+
+main {
+  flex: 1 1 auto;
+  padding: 4px 20px 20px;
+  width: 100%;
+}
+
+.page-foot {
+  position: sticky;
+  bottom: 0;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 20px;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  background: var(--vscode-editor-background);
+}
+
+.page-foot .right {
+  display: flex;
+  gap: 8px;
+}
+
+.banner {
+  margin: 0 20px 8px;
+  padding: 8px 12px;
+  border-radius: 4px;
+  border-left: 3px solid var(--vscode-editorWarning-foreground, #cca700);
+  background: var(--vscode-inputValidation-warningBackground, rgba(204, 167, 0, 0.12));
+  font-size: 0.92em;
+}
+
+/* ---------------------------------------------------------------- 卡片 */
+
+.card {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  padding: 12px 14px 14px;
+  margin-bottom: 12px;
+  background: var(--vscode-editorWidget-background, transparent);
+}
+
+.card > h2,
+.card-head h2 {
+  margin: 0 0 10px;
+  font-size: 1em;
+  font-weight: 600;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.card-head h2 {
+  margin-bottom: 10px;
+}
+
+details.card > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 1em;
+}
+
+details.card[open] > summary {
+  margin-bottom: 10px;
+}
+
+.limits ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.limits li {
+  margin-bottom: 4px;
+  line-height: 1.5;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px 16px;
+}
+
+/* ---------------------------------------------------------------- 字段 */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.field > span:first-child {
+  font-size: 0.92em;
+}
+
+.field em.lock {
+  font-style: normal;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.88em;
+}
+
+input[type='text'],
+input[type='number'],
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.4)));
+  border-radius: 3px;
+  padding: 4px 7px;
+  width: 100%;
+  min-width: 0;
+}
+
+textarea {
+  resize: vertical;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+input:disabled,
+select:disabled,
+textarea:disabled {
+  opacity: 0.65;
+}
+
+input[type='checkbox'] {
+  margin: 0;
+  vertical-align: middle;
+}
+
+.hint {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.86em;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+/* 额外列子句（MySQL 的 ON UPDATE …）：只读，但必须让人看见它存在 */
+.extra-clause {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  opacity: 0.85;
+  cursor: help;
+}
+
+/* ---------------------------------------------------------------- 列定义表格 */
+
+.columns-wrap {
+  margin-top: 10px;
+  overflow-x: auto;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  border-radius: 4px;
+}
+
+table.columns {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 940px;
+}
+
+table.columns th,
+table.columns td {
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
+  padding: 5px 6px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+table.columns thead th {
+  position: sticky;
+  top: 0;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  font-weight: 600;
+  font-size: 0.9em;
+  white-space: nowrap;
+  z-index: 1;
+}
+
+table.columns tbody tr:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.1));
+}
+
+table.columns td input[type='text'] {
+  padding: 3px 6px;
+}
+
+.col-order {
+  width: 34px;
+  text-align: right !important;
+  color: var(--vscode-descriptionForeground);
+}
+
+.row-index {
+  font-variant-numeric: tabular-nums;
+}
+
+.col-name {
+  width: 16%;
+}
+
+.col-type {
+  width: 16%;
+}
+
+.col-default {
+  width: 16%;
+}
+
+.col-comment {
+  width: 18%;
+}
+
+.col-flag {
+  width: 46px;
+  text-align: center !important;
+}
+
+.col-actions {
+  width: 92px;
+  white-space: nowrap;
+  text-align: right !important;
+}
+
+/* ---------------------------------------------------------------- 语句预览 */
+
+.sql-preview {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.1));
+  color: var(--vscode-editor-foreground);
+}
+
+.changes {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.88em;
+  text-align: right;
+}
+
+.warnings {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+/* ---------------------------------------------------------------- 结果提示 */
+
+.result-box {
+  margin: 4px 0 12px;
+  padding: 9px 12px;
+  border-radius: 4px;
+  border-left: 3px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.4));
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.1));
+  font-size: 0.94em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.result-box.ok {
+  border-left-color: var(--vscode-charts-green, #3fb950);
+}
+
+.result-box.error {
+  border-left-color: var(--vscode-errorForeground, #f14c4c);
+  color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.result-box.busy {
+  border-left-color: var(--vscode-editorWarning-foreground, #cca700);
+}
+
+/* ---------------------------------------------------------------- 按钮 */
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+
+button.primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+button.primary:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+button.primary.emphasis {
+  font-weight: 600;
+}
+
+button.secondary {
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border-color: var(--vscode-panel-border, rgba(128, 128, 128, 0.4));
+}
+
+button.secondary:hover {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.15));
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--vscode-foreground);
+  border-color: transparent;
+  padding: 2px 6px;
+  line-height: 1.2;
+}
+
+button.ghost:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

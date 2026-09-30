@@ -8,6 +8,10 @@
  * 单元格编辑同样遵循这条边界：Webview 只回传「第几行第几列改成了什么」，
  * 行定位（主键值）由扩展侧从自己持有的原始结果里取——Webview 里的排序、
  * 分页都可能让下标漂移，信任它等于把 UPDATE 打到错误的行上。
+ *
+ * 面板本身按「复用键」持有多个实例（键由调用方给出，表数据预览按「连接 + 库 / schema + 表」
+ * 生成）：一张表一个窗口，各自持有自己的结果集，互不覆盖。SQL 编辑器的临时查询用缺省键，
+ * 仍旧共用一个「查询结果」窗口。
  */
 
 import * as vscode from 'vscode';
@@ -40,11 +44,34 @@ export type { ExportFormat };
 
 const EXPORT_FORMATS: ExportFormat[] = ['csv', 'json', 'jsonl', 'xlsx'];
 
+export interface ResultPanelOptions {
+  /** 复用键：同键复用同一个窗口。缺省为通用的「查询结果」面板。 */
+  key?: string;
+  /** 窗口标签标题（同时作为 Webview 的 `<title>`）。缺省「查询结果」。 */
+  title?: string;
+  viewColumn?: vscode.ViewColumn;
+  /** 批量开窗时置 true：新窗口不抢焦点，避免每开一个窗口都把用户视线扯走一次。 */
+  preserveFocus?: boolean;
+}
+
 export class ResultPanel {
-  private static current: ResultPanel | undefined;
+  /** 按复用键持有实例：不同表 / 不同连接各占一个窗口，结果互不覆盖。 */
+  private static readonly panels = new Map<string, ResultPanel>();
+  /** 缺省键：SQL 编辑器里的临时查询共用一个窗口，行为与本特性之前一致。 */
+  private static readonly DEFAULT_KEY = 'query-result';
+
+  /**
+   * 最近获得焦点的面板。
+   *
+   * 导出 / 清空这两条命令面板入口没有编辑器上下文，只能作用于「用户当前在看的那一个」；
+   * 跟踪焦点状态由 `onDidChangeViewState` 驱动，取不到时退回最近一次显示的窗口。
+   */
+  private static focused: ResultPanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly key: string;
+  private disposed = false;
   private result?: QueryResult;
   private context: ResultContext = { connectionName: '' };
   /** 当前激活的结果集下标，由 Webview 回传，用于导出对应结果。 */
@@ -52,40 +79,84 @@ export class ResultPanel {
   /** 最近一次单元格编辑生成的 SQL，回传 Webview 展示，便于用户核对改了什么。 */
   private lastEditSql?: string;
 
-  static show(extensionUri: vscode.Uri, viewColumn: vscode.ViewColumn = vscode.ViewColumn.Beside): ResultPanel {
-    if (ResultPanel.current) {
-      ResultPanel.current.panel.reveal(viewColumn, true);
-      return ResultPanel.current;
+  static show(extensionUri: vscode.Uri, options: ResultPanelOptions = {}): ResultPanel {
+    const key = options.key ?? ResultPanel.DEFAULT_KEY;
+    const title = options.title ?? '查询结果';
+    const viewColumn = options.viewColumn ?? vscode.ViewColumn.Beside;
+
+    const existing = ResultPanel.panels.get(key);
+    if (existing) {
+      // 同一张表再次「查看数据」= 刷新已有窗口，而不是再开一个重名的
+      existing.setTitle(title);
+      existing.panel.reveal(viewColumn, !options.preserveFocus);
+      if (!options.preserveFocus) {
+        ResultPanel.focused = existing;
+      }
+      return existing;
     }
-    const panel = vscode.window.createWebviewPanel('dbviewer.result', '查询结果', viewColumn, {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
-    });
-    ResultPanel.current = new ResultPanel(panel, extensionUri);
-    return ResultPanel.current;
+
+    const panel = vscode.window.createWebviewPanel(
+      'dbviewer.result',
+      title,
+      options.preserveFocus ? { viewColumn, preserveFocus: true } : viewColumn,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
+      },
+    );
+    const instance = new ResultPanel(panel, extensionUri, key, title);
+    ResultPanel.panels.set(key, instance);
+    if (!options.preserveFocus) {
+      ResultPanel.focused = instance;
+    }
+    return instance;
   }
 
   static get instance(): ResultPanel | undefined {
-    return ResultPanel.current;
+    return ResultPanel.focused ?? ResultPanel.panels.values().next().value;
+  }
+
+  /** 释放全部面板（插件停用时调用）。 */
+  static disposeAll(): void {
+    for (const instance of [...ResultPanel.panels.values()]) {
+      instance.dispose();
+    }
   }
 
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
+    key: string,
+    title: string,
   ) {
     this.panel = panel;
+    this.key = key;
     const scriptUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'result.js'));
     const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'media', 'result.css'));
-    this.panel.webview.html = buildHtml(panel.webview, scriptUri, styleUri);
+    panel.title = title;
+    panel.webview.html = buildHtml(panel.webview, scriptUri, styleUri, title);
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    this.panel.onDidChangeViewState(
+      () => {
+        if (this.panel.active) {
+          ResultPanel.focused = this;
+        }
+      },
+      null,
+      this.disposables,
+    );
     this.panel.webview.onDidReceiveMessage(
       (message: { type: string; [key: string]: unknown }) => this.onMessage(message),
       null,
       this.disposables,
     );
     this.panel.iconPath = new vscode.ThemeIcon('table');
+    // 首个窗口没有焦点事件也要能被 instance 取到（命令面板入口的兜底）
+    if (!ResultPanel.focused) {
+      ResultPanel.focused = this;
+    }
   }
 
   /** 展示新的查询结果。 */
@@ -119,8 +190,27 @@ export class ResultPanel {
     await this.exportResult(this.activeSetIndex, format);
   }
 
-  async dispose(): Promise<void> {
-    ResultPanel.current = undefined;
+  /** 更新窗口标签（表数据预览每次「查看数据」都按命名空间重算，避免标题过期）。 */
+  setTitle(title: string): void {
+    this.panel.title = title;
+  }
+
+  /**
+   * 关闭面板。
+   *
+   * 同步从注册表注销（而不是等 `onDidDispose` 回调）：关闭后同一张表要能马上重新开窗，
+   * 依赖异步回调会留下「刚关掉又点一次，窗口没出来」的空档，测试里也无从等待。
+   * 幂等：`onDidDispose` 触发的第二次调用直接返回。
+   */
+  dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    ResultPanel.panels.delete(this.key);
+    if (ResultPanel.focused === this) {
+      ResultPanel.focused = ResultPanel.panels.values().next().value;
+    }
     this.panel.dispose();
     for (const disposable of this.disposables) {
       disposable.dispose();
@@ -399,7 +489,30 @@ function timestamp(): string {
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
-function buildHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vscode.Uri): string {
+/** 库名 / 表名来自数据库元数据，拼进 HTML 前一律转义。 */
+function escapeHtml(text: string): string {
+  return text.replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      default:
+        return '&#39;';
+    }
+  });
+}
+
+function buildHtml(
+  webview: vscode.Webview,
+  scriptUri: vscode.Uri,
+  styleUri: vscode.Uri,
+  title: string,
+): string {
   const csp = [
     "default-src 'none'",
     `style-src ${webview.cspSource}`,
@@ -414,7 +527,7 @@ function buildHtml(webview: vscode.Webview, scriptUri: vscode.Uri, styleUri: vsc
   <meta http-equiv="Content-Security-Policy" content="${csp}" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link href="${styleUri}" rel="stylesheet" />
-  <title>查询结果</title>
+  <title>${escapeHtml(title)}</title>
 </head>
 <body>
   <header class="toolbar">

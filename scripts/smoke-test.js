@@ -1022,6 +1022,734 @@ function fakeDriver(options) {
     assert.strictEqual(sink.isClosed, false);
   });
 
+  // ---------------------------------------------------------------- 表数据预览
+
+  console.log('\n=== 16. 表数据预览：多选目标收集 ===');
+  const tableTargets = require(path.join(outDir, 'core', 'tableTargets.js'));
+
+  check('多选保序且同表去重', () => {
+    const collected = tableTargets.collectTableDataTargets([
+      { kind: 'table', profileId: 'p1', database: 'app', table: 'users' },
+      { kind: 'table', profileId: 'p1', database: 'app', table: 'orders' },
+      { kind: 'table', profileId: 'p1', database: 'app', table: 'users' },
+    ]);
+    assert.strictEqual(collected.problem, undefined);
+    assert.deepStrictEqual(collected.targets.map((t) => t.table), ['users', 'orders']);
+    assert.strictEqual(collected.targets[0].kind, 'table');
+  });
+
+  check('同名表来自不同库 / schema / 连接时各自保留', () => {
+    const collected = tableTargets.collectTableDataTargets([
+      { kind: 'table', profileId: 'p1', database: 'app', table: 'users' },
+      { kind: 'table', profileId: 'p1', database: 'shop', table: 'users' },
+      { kind: 'table', profileId: 'p1', schema: 'public', table: 'users' },
+      { kind: 'table', profileId: 'p2', database: 'app', table: 'users' },
+    ]);
+    assert.strictEqual(collected.targets.length, 4, '命名空间或连接不同就不该被去重');
+  });
+
+  check('视图节点同样可开窗，并保真 kind', () => {
+    const collected = tableTargets.collectTableDataTargets([
+      { kind: 'table', profileId: 'p1', schema: 'public', table: 'v1', tableKind: 'view' },
+    ]);
+    assert.strictEqual(collected.targets[0].kind, 'view');
+  });
+
+  check('非表节点与缺 profileId 的节点被忽略，全无效时给出提示', () => {
+    const mixed = tableTargets.collectTableDataTargets([
+      { kind: 'column', profileId: 'p1', table: 'users' },
+      { kind: 'database', profileId: 'p1', database: 'app' },
+      { kind: 'table', database: 'app', table: 'users' },
+      { kind: 'table', profileId: 'p1', database: 'app', table: 'orders' },
+    ]);
+    assert.deepStrictEqual(mixed.targets.map((t) => t.table), ['orders']);
+    assert.ok(
+      tableTargets.collectTableDataTargets([{ kind: 'column', profileId: 'p1', table: 't' }]).problem.includes(
+        '没有选中',
+      ),
+    );
+  });
+
+  check('窗口标题 = 库名.表名，schema 优先且不留前导点', () => {
+    assert.strictEqual(tableTargets.tableDataPanelTitle({ database: 'app', table: 'users' }), 'app.users');
+    assert.strictEqual(tableTargets.tableDataPanelTitle({ schema: 'public', table: 'users' }), 'public.users');
+    assert.strictEqual(
+      tableTargets.tableDataPanelTitle({ database: 'app', schema: 'public', table: 'users' }),
+      'public.users',
+    );
+    assert.strictEqual(tableTargets.tableDataPanelTitle({ table: 'users' }), 'users');
+  });
+
+  check('复用键含连接与命名空间', () => {
+    const key = (target) => tableTargets.tableDataPanelKey(target);
+    assert.strictEqual(
+      key({ profileId: 'p1', database: 'app', table: 'users' }),
+      key({ profileId: 'p1', database: 'app', table: 'users' }),
+    );
+    assert.notStrictEqual(
+      key({ profileId: 'p1', database: 'app', table: 'users' }),
+      key({ profileId: 'p2', database: 'app', table: 'users' }),
+    );
+    assert.notStrictEqual(
+      key({ profileId: 'p1', schema: 'a', table: 't' }),
+      key({ profileId: 'p1', schema: 'b', table: 't' }),
+    );
+  });
+
+  console.log('\n=== 17. 结构变更：差异计算与校验 ===');
+  const objectEditor = require(path.join(outDir, 'core', 'objectEditor.js'));
+
+  /** 造一列；测试里只关心被显式覆盖的字段。 */
+  const col = (over) =>
+    Object.assign(
+      { name: 'c', dataType: 'int', nullable: true, defaultValue: null, comment: '', isPrimaryKey: false, autoIncrement: false },
+      over || {},
+    );
+  const sameAll = (a, b) =>
+    a.dataType === b.dataType &&
+    a.nullable === b.nullable &&
+    objectEditor.normalizeDefaultText(a.defaultValue) === objectEditor.normalizeDefaultText(b.defaultValue) &&
+    (a.comment || '') === (b.comment || '');
+
+  check('类型文本归一：忽略大小写与括号空白', () => {
+    assert.strictEqual(
+      objectEditor.normalizeTypeText('  INT ( 11 ) '),
+      objectEditor.normalizeTypeText('int(11)'),
+    );
+    assert.strictEqual(objectEditor.normalizeTypeText('DECIMAL( 10 , 2 )'), 'decimal(10,2)');
+  });
+
+  check('默认值归一：空串与「无默认值」不能混为一谈', () => {
+    assert.strictEqual(objectEditor.normalizeDefaultText(null), '');
+    assert.strictEqual(objectEditor.normalizeDefaultText(undefined), '');
+    assert.strictEqual(objectEditor.normalizeDefaultText("'abc'"), 'abc');
+    // MariaDB 带引号、MySQL 不带引号，归一后必须相等，否则每次保存都会白生成 ALTER
+    assert.strictEqual(objectEditor.normalizeDefaultText("'abc'"), objectEditor.normalizeDefaultText('abc'));
+    assert.strictEqual(objectEditor.normalizeDefaultText("''"), "''");
+    assert.notStrictEqual(objectEditor.normalizeDefaultText("''"), objectEditor.normalizeDefaultText(null));
+  });
+
+  check('列差异：认列靠 originalName，改名不算删旧增新', () => {
+    const diff = objectEditor.diffTableColumns(
+      [col({ name: 'a' }), col({ name: 'b' })],
+      [col({ name: 'a2', originalName: 'a' }), col({ name: 'b', originalName: 'b' })],
+      sameAll,
+    );
+    assert.strictEqual(diff.steps[0].renamed, true);
+    assert.strictEqual(diff.steps[0].modified, false, '仅改名不该判成定义变更');
+    assert.deepStrictEqual(diff.dropped, [], '改名被误判为删列');
+  });
+
+  check('列差异：类型 / 可空 / 默认值 / 注释变化都算 modified', () => {
+    const origin = [col({ name: 'a', dataType: 'int', nullable: false, defaultValue: '1', comment: '旧' })];
+    const diff = objectEditor.diffTableColumns(
+      origin,
+      [col({ name: 'a', originalName: 'a', dataType: 'bigint', nullable: true, defaultValue: '2', comment: '新' })],
+      sameAll,
+    );
+    assert.strictEqual(diff.steps[0].modified, true);
+  });
+
+  check('列差异：列序变化只在既有列之间判定，纯新增不算重排', () => {
+    const origin = [col({ name: 'a' }), col({ name: 'b' })];
+    const reordered = objectEditor.diffTableColumns(
+      origin,
+      [col({ name: 'b', originalName: 'b' }), col({ name: 'a', originalName: 'a' })],
+      sameAll,
+      true,
+    );
+    assert.strictEqual(reordered.orderChanged, true);
+    assert.strictEqual(reordered.steps[0].reposition, true);
+    assert.strictEqual(reordered.steps[0].after, undefined, '首列没有前驱');
+
+    const appended = objectEditor.diffTableColumns(origin, [col({ name: 'a', originalName: 'a' }), col({ name: 'b', originalName: 'b' }), col({ name: 'c' })], sameAll, true);
+    assert.strictEqual(appended.orderChanged, false, '纯新增被误判成整表重排');
+    assert.strictEqual(appended.steps[2].reposition, true, '新增列必须落到目标位置');
+    assert.strictEqual(appended.steps[2].after, 'b');
+  });
+
+  check('列差异：不支持调序时不产生位置子句', () => {
+    const diff = objectEditor.diffTableColumns(
+      [col({ name: 'a' }), col({ name: 'b' })],
+      [col({ name: 'b', originalName: 'b' }), col({ name: 'a', originalName: 'a' })],
+      sameAll,
+      false,
+    );
+    assert.strictEqual(diff.orderChanged, true, '仍要能提示用户「顺序改动被忽略」');
+    assert.strictEqual(diff.steps[0].reposition, false);
+  });
+
+  check('列差异：未带回 originalName 的列一律按新增处理', () => {
+    const diff = objectEditor.diffTableColumns([col({ name: 'a' })], [col({ name: 'a' })], sameAll);
+    assert.strictEqual(diff.steps[0].origin, undefined);
+    assert.strictEqual(diff.dropped.length, 1);
+  });
+
+  check('变更摘要覆盖新增 / 改名 / 修改 / 删除 / 调序', () => {
+    const diff = objectEditor.diffTableColumns(
+      [col({ name: 'a' }), col({ name: 'gone' }), col({ name: 'm', dataType: 'int' })],
+      [col({ name: 'r', originalName: 'a' }), col({ name: 'm', originalName: 'm', dataType: 'bigint' }), col({ name: 'n' })],
+      sameAll,
+      true,
+    );
+    const lines = objectEditor.summarizeColumnsDiff(diff);
+    assert.ok(lines.some((l) => l.includes('重命名列 a → r')), lines.join('|'));
+    assert.ok(lines.some((l) => l.includes('修改列 m')), lines.join('|'));
+    assert.ok(lines.some((l) => l.includes('新增列 n')), lines.join('|'));
+    assert.ok(lines.some((l) => l.includes('删除列 gone')), lines.join('|'));
+  });
+
+  check('主键差异：重命名列上的主键不算换主键', () => {
+    const same = objectEditor.diffPrimaryKey(
+      [col({ name: 'id', isPrimaryKey: true })],
+      [col({ name: 'uid', originalName: 'id', isPrimaryKey: true })],
+    );
+    assert.strictEqual(same.changed, false);
+    assert.deepStrictEqual(same.target, ['uid']);
+  });
+
+  check('主键差异：增删列都能识别', () => {
+    const added = objectEditor.diffPrimaryKey(
+      [col({ name: 'a' })],
+      [col({ name: 'a', isPrimaryKey: true })],
+    );
+    assert.strictEqual(added.changed, true);
+    assert.deepStrictEqual(added.added, ['a']);
+
+    const removed = objectEditor.diffPrimaryKey(
+      [col({ name: 'a', isPrimaryKey: true }), col({ name: 'b', isPrimaryKey: true })],
+      [col({ name: 'a', originalName: 'a', isPrimaryKey: true }), col({ name: 'b', originalName: 'b' })],
+    );
+    assert.strictEqual(removed.changed, true);
+    assert.deepStrictEqual(removed.removed, ['b']);
+  });
+
+  check('属性差异：只比较可编辑且被提交的键', () => {
+    const current = [
+      { key: 'name', label: '表名', value: 'users', kind: 'text' },
+      { key: 'engine', label: '存储引擎', value: 'InnoDB', kind: 'text' },
+      { key: 'collation', label: '排序规则', value: 'utf8mb4_general_ci', kind: 'text' },
+      { key: 'ro', label: '只读项', value: 'x', kind: 'text', editable: false },
+    ];
+    const changes = objectEditor.diffProperties(current, { engine: 'MyISAM', name: 'users', ro: 'y' });
+    assert.deepStrictEqual(changes.map((c) => c.key), ['engine']);
+    assert.strictEqual(objectEditor.propertyChangeValue(changes, 'engine'), 'MyISAM');
+    // 未提交的键不能被当成「改成空」
+    assert.strictEqual(objectEditor.propertyChangeValue(changes, 'collation'), undefined);
+  });
+
+  check('列定义校验：空表 / 空列名 / 重名（不分大小写）/ 空类型', () => {
+    assert.ok(objectEditor.validateColumnDefinitions([]).includes('至少'));
+    assert.ok(objectEditor.validateColumnDefinitions([col({ name: '  ' })]).includes('列名'));
+    assert.ok(objectEditor.validateColumnDefinitions([col({ name: 'A' }), col({ name: 'a' })]).includes('重复'));
+    assert.ok(objectEditor.validateColumnDefinitions([col({ name: 'a', dataType: '' })]).includes('数据类型'));
+    assert.strictEqual(objectEditor.validateColumnDefinitions([col({ name: 'a' })]), undefined);
+  });
+
+  check('对象名校验：空 / 超 63 字符 / 控制字符', () => {
+    assert.ok(objectEditor.validateObjectName('', '表名').includes('不能为空'));
+    assert.ok(objectEditor.validateObjectName('a'.repeat(64), '表名').includes('过长'));
+    assert.strictEqual(objectEditor.validateObjectName('a'.repeat(63), '表名'), undefined);
+    assert.ok(objectEditor.validateObjectName('a\u0000b', '表名').includes('控制字符'));
+  });
+
+  check('空计划判定', () => {
+    assert.strictEqual(objectEditor.planIsEmpty({ statements: [] }), true);
+    assert.strictEqual(objectEditor.planIsEmpty(undefined), true);
+    assert.strictEqual(objectEditor.planIsEmpty({ statements: ['SELECT 1'] }), false);
+  });
+
+  console.log('\n=== 18. 结构变更：MySQL 语句生成 ===');
+  const mysqlStructure = require(path.join(outDir, 'drivers', 'mysqlStructure.js'));
+  const mysqlCtx = { defaultCollationOf: async (charset) => (charset === 'utf8mb4' ? 'utf8mb4_0900_ai_ci' : undefined) };
+  const mysqlTable = (columns, properties) => ({
+    target: { database: 'app', table: 'users' },
+    columns,
+    properties: properties || [
+      { key: 'name', label: '表名', value: 'users', kind: 'text' },
+      { key: 'engine', label: '存储引擎', value: 'InnoDB', kind: 'text', options: ['InnoDB', 'MyISAM'] },
+      { key: 'charset', label: '字符集', value: 'utf8mb4', kind: 'select' },
+      { key: 'collation', label: '排序规则', value: 'utf8mb4_general_ci', kind: 'select' },
+      { key: 'comment', label: '表注释', value: '', kind: 'text' },
+    ],
+    limitations: [],
+    allowReorder: true,
+    allowAutoIncrement: true,
+  });
+
+  await checkAsync('MySQL：新增列带 FIRST / AFTER，并保留注释与自增', async () => {
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      mysqlTable([col({ name: 'id', dataType: 'int', nullable: false, isPrimaryKey: true, autoIncrement: true })]),
+      {
+        target: { database: 'app', table: 'users' },
+        properties: {},
+        columns: [
+          col({ name: 'id', originalName: 'id', dataType: 'int', nullable: false, isPrimaryKey: true, autoIncrement: true }),
+          col({ name: 'email', dataType: 'varchar(120)', nullable: false, defaultValue: null, comment: "邮箱" }),
+        ],
+      },
+      mysqlCtx,
+    );
+    assert.strictEqual(plan.statements.length, 1);
+    assert.ok(plan.statements[0].startsWith('ALTER TABLE `app`.`users`'), plan.statements[0]);
+    assert.ok(plan.statements[0].includes('ADD COLUMN `email` varchar(120) NOT NULL COMMENT '), plan.statements[0]);
+    assert.ok(plan.statements[0].includes('AFTER `id`'), '新增列必须落到目标位置');
+    // 完全没动的列不该出现在语句里
+    assert.ok(!plan.statements[0].includes('MODIFY COLUMN `id`'), plan.statements[0]);
+  });
+
+  await checkAsync('MySQL：默认值按类型补引号，空串与表达式各走各的', async () => {
+    const render = (column) => mysqlStructure.renderMysqlColumn(column);
+    assert.ok(render(col({ name: 'n', dataType: 'varchar(10)' })).endsWith('`n` varchar(10)'));
+    assert.ok(render(col({ name: 'n', dataType: 'varchar(10)', defaultValue: 'abc' })).includes("DEFAULT 'abc'"));
+    assert.ok(render(col({ name: 'n', dataType: 'varchar(10)', defaultValue: '' })).includes("DEFAULT ''"));
+    assert.ok(render(col({ name: 'n', dataType: 'int', defaultValue: '0' })).includes('DEFAULT 0'));
+    assert.ok(render(col({ name: 'n', dataType: 'timestamp', defaultValue: 'CURRENT_TIMESTAMP(3)' })).includes('DEFAULT CURRENT_TIMESTAMP(3)'));
+    assert.ok(render(col({ name: 'n', dataType: 'datetime', defaultValue: 'now()' })).includes('DEFAULT (now())'), 'MySQL 8 的表达式默认值需要括号');
+    assert.ok(render(col({ name: 'n', dataType: 'int', defaultValue: "b'0'" })).includes("DEFAULT b'0'"));
+    // 可空列省略 NULL 关键字
+    assert.ok(!render(col({ name: 'n', dataType: 'int', nullable: true })).includes('NULL'));
+  });
+
+  await checkAsync('MySQL：ON UPDATE 子句必须原样保留（改写别的属性时丢掉它 = 静默改表行为）', async () => {
+    const render = (column) => mysqlStructure.renderMysqlColumn(column);
+    const onUpdate = render(
+      col({ name: 'updated_at', dataType: 'timestamp', nullable: false, defaultValue: 'CURRENT_TIMESTAMP', extraClauses: 'ON UPDATE CURRENT_TIMESTAMP' }),
+    );
+    assert.ok(onUpdate.includes('DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'), onUpdate);
+
+    const current = mysqlTable([
+      col({ name: 'id', nullable: false, isPrimaryKey: true }),
+      col({ name: 'updated_at', dataType: 'timestamp', nullable: false, defaultValue: 'CURRENT_TIMESTAMP', extraClauses: 'ON UPDATE CURRENT_TIMESTAMP' }),
+    ]);
+
+    // 界面只改了注释：ON UPDATE 既不能出现在语句里（说明被判成变化），也不能被丢掉
+    const untouched = await mysqlStructure.buildMysqlTablePlan(
+      current,
+      {
+        target: { database: 'app', table: 'users' },
+        properties: {},
+        columns: [
+          col({ name: 'id', originalName: 'id', nullable: false, isPrimaryKey: true }),
+          col({ name: 'updated_at', originalName: 'updated_at', dataType: 'timestamp', nullable: false, defaultValue: 'CURRENT_TIMESTAMP', extraClauses: 'ON UPDATE CURRENT_TIMESTAMP' }),
+        ],
+      },
+      mysqlCtx,
+    );
+    assert.deepStrictEqual(untouched.statements, [], untouched.statements.join('\n'));
+
+    // 客户端没回传 extraClauses（老版本界面 / 第三方调用）：按 originalName 从现状继承
+    const inherited = mysqlStructure.inheritMysqlExtraClauses(current, {
+      target: { database: 'app', table: 'users' },
+      properties: {},
+      columns: [
+        col({ name: 'id', originalName: 'id', nullable: false, isPrimaryKey: true }),
+        col({ name: 'updated_at', originalName: 'updated_at', dataType: 'timestamp', nullable: false, defaultValue: 'CURRENT_TIMESTAMP', comment: '改个注释' }),
+      ],
+    });
+    assert.strictEqual(inherited.columns[1].extraClauses, 'ON UPDATE CURRENT_TIMESTAMP');
+    const plan = await mysqlStructure.buildMysqlTablePlan(current, inherited, mysqlCtx);
+    assert.ok(plan.statements[0].includes('ON UPDATE CURRENT_TIMESTAMP'), plan.statements[0]);
+    assert.ok(plan.statements[0].includes('COMMENT'), plan.statements[0]);
+  });
+
+  await checkAsync('MySQL：TEXT / JSON 的默认值只能写成表达式形式（真库实测：裸写会被服务端拒绝）', async () => {
+    const render = (column) => mysqlStructure.renderMysqlColumn(column);
+    assert.ok(render(col({ name: 'n', dataType: 'text', defaultValue: 'hello' })).includes("DEFAULT ('hello')"));
+    assert.ok(render(col({ name: 'n', dataType: 'longtext', defaultValue: '' })).includes("DEFAULT ('')"));
+    assert.ok(render(col({ name: 'n', dataType: 'json', defaultValue: '{}' })).includes("DEFAULT ('{}')"));
+    assert.ok(render(col({ name: 'n', dataType: 'blob', defaultValue: '' })).includes("DEFAULT ('')"));
+    // varchar 的空串默认值保持裸引号写法，别被上面的规则带偏
+    assert.ok(render(col({ name: 'n', dataType: 'varchar(10)', defaultValue: '' })).includes("DEFAULT ''"));
+    assert.ok(!render(col({ name: 'n', dataType: 'varchar(10)', defaultValue: '' })).includes("DEFAULT ('')"));
+  });
+
+  await checkAsync('MySQL：读回的表达式默认值要反转义后再写回（`_utf8mb4\\\'x\\\'` → `DEFAULT (_utf8mb4\'x\')`）', async () => {
+    const render = (column) => mysqlStructure.renderMysqlColumn(column);
+    const readBack = "_utf8mb4\\'hello\\'";
+    const sql = render(col({ name: 'n', dataType: 'text', defaultValue: readBack }));
+    assert.ok(sql.includes("DEFAULT (_utf8mb4'hello')"), sql);
+    assert.ok(!sql.includes('\\'), '反斜杠转义必须被解掉，否则服务端报语法错误：' + sql);
+    // 反斜杠本身也要能正确还原（\\' 是「转义反斜杠 + 引号」，不能多吃一层）
+    const slash = render(col({ name: 'n', dataType: 'text', defaultValue: "_utf8mb4\\'a\\\\b\\'" }));
+    assert.ok(slash.includes("DEFAULT (_utf8mb4'a\\b')"), slash);
+    // 已带括号的表达式不重复补括号
+    assert.ok(render(col({ name: 'n', dataType: 'int', defaultValue: '(1 + 2)' })).includes('DEFAULT (1 + 2)'));
+    // 数字类型上手打的表达式：MySQL 8 不接受裸表达式，必须补括号
+    assert.ok(render(col({ name: 'n', dataType: 'int', defaultValue: '3 * 7' })).includes('DEFAULT (3 * 7)'));
+    assert.ok(render(col({ name: 'n', dataType: 'int', defaultValue: '-1' })).includes('DEFAULT -1'));
+  });
+
+  await checkAsync('MySQL：删主键子句必须排在删列之前', async () => {
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      mysqlTable([col({ name: 'id', nullable: false, isPrimaryKey: true }), col({ name: 'keep', dataType: 'int' })]),
+      { target: { database: 'app', table: 'users' }, properties: {}, columns: [col({ name: 'keep', originalName: 'keep', dataType: 'int' })] },
+      mysqlCtx,
+    );
+    const sql = plan.statements[0];
+    assert.ok(sql.includes('DROP PRIMARY KEY'), sql);
+    assert.ok(sql.includes('DROP COLUMN `id`'), sql);
+    assert.ok(sql.indexOf('DROP PRIMARY KEY') < sql.indexOf('DROP COLUMN `id`'), '主键删除必须排在删列之前，否则删列会连带丢掉主键');
+    assert.ok(!sql.includes('ADD PRIMARY KEY'), '无主键目标时不该补主键');
+    assert.ok(plan.warnings.some((w) => w.includes('数据')), '删列必须给出丢数据提示');
+  });
+
+  await checkAsync('MySQL：主键新增排在列变更之后（列先存在）', async () => {
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      mysqlTable([col({ name: 'code', dataType: 'varchar(10)', nullable: false })]),
+      {
+        target: { database: 'app', table: 'users' },
+        properties: {},
+        columns: [col({ name: 'code', originalName: 'code', dataType: 'varchar(10)', nullable: false, isPrimaryKey: true })],
+      },
+      mysqlCtx,
+    );
+    const sql = plan.statements[0];
+    assert.ok(sql.includes('ADD PRIMARY KEY (`code`)'), sql);
+    assert.ok(!sql.includes('DROP PRIMARY KEY'), '原本没有主键就不该删');
+  });
+
+  await checkAsync('MySQL：改名走 CHANGE COLUMN，并保持同一列只出现一次', async () => {
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      mysqlTable([col({ name: 'a', dataType: 'int', nullable: false })]),
+      {
+        target: { database: 'app', table: 'users' },
+        properties: {},
+        columns: [col({ name: 'b', originalName: 'a', dataType: 'bigint', nullable: false, defaultValue: '3' })],
+      },
+      mysqlCtx,
+    );
+    const sql = plan.statements[0];
+    assert.ok(sql.includes('CHANGE COLUMN `a` `b` bigint NOT NULL DEFAULT 3'), sql);
+    assert.ok(!sql.includes('MODIFY COLUMN `b`'), '同一列不能既 CHANGE 又 MODIFY');
+  });
+
+  await checkAsync('MySQL：只改字符集时自动补该字符集的默认排序规则', async () => {
+    const structure = mysqlTable([col({ name: 'a' })]);
+    structure.properties = structure.properties.map((property) =>
+      property.key === 'charset'
+        ? Object.assign({}, property, { value: 'latin1' })
+        : property.key === 'collation'
+          ? Object.assign({}, property, { value: 'latin1_swedish_ci' })
+          : property,
+    );
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      structure,
+      {
+        target: { database: 'app', table: 'users' },
+        columns: [col({ name: 'a', originalName: 'a' })],
+        properties: { charset: 'utf8mb4', collation: 'latin1_swedish_ci', engine: 'InnoDB', name: 'users', comment: '' },
+      },
+      { defaultCollationOf: async () => 'utf8mb4_unicode_ci' },
+    );
+    assert.ok(plan.statements[0].includes('DEFAULT CHARACTER SET = utf8mb4'), plan.statements[0]);
+    assert.ok(plan.statements[0].includes('COLLATE = utf8mb4_unicode_ci'), plan.statements[0]);
+    // 用户明确选了排序规则时不该被默认值覆盖
+    const explicit = await mysqlStructure.buildMysqlTablePlan(
+      structure,
+      {
+        target: { database: 'app', table: 'users' },
+        columns: [col({ name: 'a', originalName: 'a' })],
+        properties: { charset: 'utf8mb4', collation: 'utf8mb4_bin', engine: 'InnoDB', name: 'users', comment: '' },
+      },
+      { defaultCollationOf: async () => 'utf8mb4_unicode_ci' },
+    );
+    assert.ok(explicit.statements[0].includes('COLLATE = utf8mb4_bin'), explicit.statements[0]);
+    assert.ok(!explicit.statements[0].includes('utf8mb4_unicode_ci'), explicit.statements[0]);
+  });
+
+  await checkAsync('MySQL：表改名是最后一条语句（前面的子句按旧名寻址）', async () => {
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      mysqlTable([col({ name: 'a' })]),
+      {
+        target: { database: 'app', table: 'users' },
+        columns: [col({ name: 'a', originalName: 'a' })],
+        properties: { name: 'members' },
+      },
+      mysqlCtx,
+    );
+    assert.strictEqual(plan.statements.length, 1);
+    assert.strictEqual(plan.statements[0], 'RENAME TABLE `app`.`users` TO `app`.`members`;');
+  });
+
+  await checkAsync('MySQL：非法列定义与非法表名在生成阶段就被拦下', async () => {
+    const bad = { target: { database: 'app', table: 'users' }, properties: {}, columns: [col({ name: 'a' }), col({ name: 'A' })] };
+    await assert.rejects(() => mysqlStructure.buildMysqlTablePlan(mysqlTable([col({ name: 'a' })]), bad, mysqlCtx), /重复/);
+    await assert.rejects(
+      () =>
+        mysqlStructure.buildMysqlTablePlan(
+          mysqlTable([col({ name: 'a' })]),
+          { target: { database: 'app', table: 'users' }, columns: [col({ name: 'a', originalName: 'a' })], properties: { name: 'x'.repeat(64) } },
+          mysqlCtx,
+        ),
+      /过长/,
+    );
+  });
+
+  await checkAsync('MySQL：AUTO_INCREMENT 无主键时给出提示；库属性用 ALTER DATABASE', async () => {
+    const plan = await mysqlStructure.buildMysqlTablePlan(
+      mysqlTable([col({ name: 'a' })]),
+      {
+        target: { database: 'app', table: 'users' },
+        columns: [col({ name: 'a', originalName: 'a' }), col({ name: 'seq', dataType: 'int', autoIncrement: true })],
+        properties: {},
+      },
+      mysqlCtx,
+    );
+    assert.ok(plan.warnings.some((w) => w.includes('AUTO_INCREMENT')), JSON.stringify(plan.warnings));
+
+    const dbPlan = await mysqlStructure.buildMysqlDatabasePlan(
+      {
+        target: { kind: 'database', name: 'app' },
+        label: '数据库',
+        properties: [
+          { key: 'name', label: '数据库名', value: 'app', kind: 'text', editable: false },
+          { key: 'charset', label: '默认字符集', value: 'utf8mb4', kind: 'select' },
+        ],
+        limitations: [],
+      },
+      { target: { kind: 'database', name: 'app' }, properties: { charset: 'utf8mb4', name: 'app' } },
+      mysqlCtx,
+    );
+    assert.deepStrictEqual(dbPlan.statements, [], '没改就不该有语句');
+    const changed = await mysqlStructure.buildMysqlDatabasePlan(
+      {
+        target: { kind: 'database', name: 'app' },
+        label: '数据库',
+        properties: [{ key: 'charset', label: '默认字符集', value: 'latin1', kind: 'select' }],
+        limitations: [],
+      },
+      { target: { kind: 'database', name: 'app' }, properties: { charset: 'utf8mb4' } },
+      mysqlCtx,
+    );
+    // ALTER DATABASE 不接受 DEFAULT 关键字（那是 ALTER TABLE 的语法），
+    // 也不接受逗号分隔的多个选项（真库实测：`CHARACTER SET = a, COLLATE = b` 直接语法错误）
+    assert.ok(changed.statements[0].startsWith('ALTER DATABASE `app`'), changed.statements[0]);
+    assert.ok(changed.statements[0].includes('CHARACTER SET = utf8mb4'), changed.statements[0]);
+    assert.ok(!changed.statements[0].includes('DEFAULT'), changed.statements[0]);
+    assert.ok(!changed.statements[0].includes(','), changed.statements[0]);
+  });
+
+  await checkAsync('MySQL：库属性同时提交字符集与排序规则时合成一条、空格相连', async () => {
+    const both = await mysqlStructure.buildMysqlDatabasePlan(
+      {
+        target: { kind: 'database', name: 'app' },
+        properties: [
+          { key: 'name', label: '数据库名', value: 'app', kind: 'text', editable: false },
+          { key: 'charset', label: '字符集', value: 'utf8mb4', kind: 'select' },
+          { key: 'collation', label: '排序规则', value: 'utf8mb4_general_ci', kind: 'select' },
+        ],
+        limitations: [],
+      },
+      { target: { kind: 'database', name: 'app' }, properties: { charset: 'latin1', collation: 'latin1_general_ci' } },
+      mysqlCtx,
+    );
+    assert.strictEqual(both.statements.length, 1, JSON.stringify(both.statements));
+    assert.ok(
+      both.statements[0].includes('CHARACTER SET = latin1 COLLATE = latin1_general_ci'),
+      both.statements[0],
+    );
+    assert.ok(!both.statements[0].includes(','), both.statements[0]);
+  });
+
+  console.log('\n=== 19. 结构变更：PostgreSQL 语句生成 ===');
+  const pgStructure = require(path.join(outDir, 'drivers', 'pgStructure.js'));
+  const pgCtx = { primaryKeyConstraint: async () => 'users_pkey' };
+  const pgTable = (columns, properties) => ({
+    target: { database: 'app', schema: 'public', table: 'users' },
+    columns,
+    properties: properties || [
+      { key: 'name', label: '表名', value: 'users', kind: 'text' },
+      { key: 'owner', label: '所有者', value: 'postgres', kind: 'select', options: ['postgres', 'app'] },
+      { key: 'comment', label: '表注释', value: '', kind: 'text' },
+    ],
+    limitations: [],
+    allowReorder: false,
+    allowAutoIncrement: false,
+  });
+
+  check('PG：类型别名归一，别把没改的类型判成有变化', () => {
+    assert.strictEqual(pgStructure.normalizePgType('character varying(255)'), pgStructure.normalizePgType('varchar(255)'));
+    assert.strictEqual(pgStructure.normalizePgType('timestamp without time zone'), 'timestamp');
+    assert.strictEqual(pgStructure.normalizePgType('int8'), 'bigint');
+    assert.strictEqual(pgStructure.normalizePgType('double precision'), 'double precision');
+  });
+
+  await checkAsync('PG：改类型带 USING 转换，未改动则不生成语句', async () => {
+    const untouched = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'a', dataType: 'character varying(255)' })]),
+      { target: { database: 'app', schema: 'public', table: 'users' }, properties: {}, columns: [col({ name: 'a', originalName: 'a', dataType: 'varchar(255)' })] },
+      pgCtx,
+    );
+    assert.deepStrictEqual(untouched.statements, [], '别名不同但类型相同，不该产生 ALTER');
+
+    const changed = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'a', dataType: 'integer' })]),
+      { target: { database: 'app', schema: 'public', table: 'users' }, properties: {}, columns: [col({ name: 'a', originalName: 'a', dataType: 'bigint' })] },
+      pgCtx,
+    );
+    assert.strictEqual(changed.statements[0], 'ALTER TABLE "public"."users" ALTER COLUMN "a" TYPE bigint USING "a"::bigint;');
+  });
+
+  await checkAsync('PG：可空 / 默认值 / 注释各自成句，清空用 DROP DEFAULT 与 IS NULL', async () => {
+    const plan = await pgStructure.buildPgTablePlan(
+      pgTable([
+        col({ name: 'a', dataType: 'text', nullable: true, defaultValue: 'now()', comment: '旧注释' }),
+      ]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        properties: {},
+        columns: [col({ name: 'a', originalName: 'a', dataType: 'text', nullable: false, defaultValue: null, comment: '' })],
+      },
+      pgCtx,
+    );
+    assert.deepStrictEqual(plan.statements, [
+      'ALTER TABLE "public"."users" ALTER COLUMN "a" SET NOT NULL;',
+      'ALTER TABLE "public"."users" ALTER COLUMN "a" DROP DEFAULT;',
+      'COMMENT ON COLUMN "public"."users"."a" IS NULL;',
+    ]);
+  });
+
+  await checkAsync('PG：新增列可空时不写 NOT NULL，注释单独下发', async () => {
+    const plan = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'id', dataType: 'integer', nullable: false })]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        properties: {},
+        columns: [
+          col({ name: 'id', originalName: 'id', dataType: 'integer', nullable: false }),
+          col({ name: 'note', dataType: 'text', comment: '备注' }),
+        ],
+      },
+      pgCtx,
+    );
+    assert.strictEqual(plan.statements[0], 'ALTER TABLE "public"."users" ADD COLUMN "note" text;');
+    assert.strictEqual(plan.statements[1], `COMMENT ON COLUMN "public"."users"."note" IS '备注';`);
+  });
+
+  await checkAsync('PG：新增 NOT NULL 无默认值的列会被预警（服务端会直接拒绝）', async () => {
+    const plan = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'id', dataType: 'integer', nullable: false })]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        properties: {},
+        columns: [
+          col({ name: 'id', originalName: 'id', dataType: 'integer', nullable: false }),
+          col({ name: 'code', dataType: 'text', nullable: false }),
+        ],
+      },
+      pgCtx,
+    );
+    assert.ok(plan.warnings.some((w) => w.includes('NOT NULL')), JSON.stringify(plan.warnings));
+
+    // 给了默认值就不该再唠叨
+    const ok = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'id', dataType: 'integer', nullable: false })]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        properties: {},
+        columns: [
+          col({ name: 'id', originalName: 'id', dataType: 'integer', nullable: false }),
+          col({ name: 'code', dataType: 'text', nullable: false, defaultValue: "'x'" }),
+        ],
+      },
+      pgCtx,
+    );
+    assert.ok(!(ok.warnings || []).some((w) => w.includes('NOT NULL')), JSON.stringify(ok.warnings));
+  });
+
+  await checkAsync('PG：删主键约束排在删列之前，新增主键排在最后', async () => {
+    const plan = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'id', dataType: 'integer', nullable: false, isPrimaryKey: true }), col({ name: 'code', dataType: 'text' })]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        properties: {},
+        columns: [col({ name: 'code', originalName: 'code', dataType: 'text', isPrimaryKey: true })],
+      },
+      pgCtx,
+    );
+    const dropConstraint = plan.statements.findIndex((s) => s.includes('DROP CONSTRAINT "users_pkey"'));
+    const dropColumn = plan.statements.findIndex((s) => s.includes('DROP COLUMN "id"'));
+    const addPk = plan.statements.findIndex((s) => s.includes('ADD PRIMARY KEY ("code")'));
+    assert.ok(dropConstraint >= 0 && dropColumn >= 0 && addPk >= 0, plan.statements.join('|'));
+    assert.ok(dropConstraint < dropColumn, '主键约束必须先删，否则删列会连带丢掉约束');
+    assert.ok(addPk > dropColumn, '新主键必须等列就位后再建');
+    assert.ok(plan.statements[addPk].startsWith('ALTER TABLE "public"."users" ADD PRIMARY KEY'));
+  });
+
+  await checkAsync('PG：列改名与表改名都是独立语句，且表改名在最后', async () => {
+    const plan = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'a', dataType: 'integer' })]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        columns: [col({ name: 'b', originalName: 'a', dataType: 'integer' })],
+        properties: { name: 'members', owner: 'postgres', comment: '' },
+      },
+      pgCtx,
+    );
+    assert.strictEqual(plan.statements[0], 'ALTER TABLE "public"."users" RENAME COLUMN "a" TO "b";');
+    assert.strictEqual(plan.statements[plan.statements.length - 1], 'ALTER TABLE "public"."users" RENAME TO "members";');
+  });
+
+  await checkAsync('PG：不支持调序 / 既有列转自增时给出提示而不是静默', async () => {
+    const plan = await pgStructure.buildPgTablePlan(
+      pgTable([col({ name: 'a', dataType: 'integer' }), col({ name: 'b', dataType: 'integer' })]),
+      {
+        target: { database: 'app', schema: 'public', table: 'users' },
+        properties: {},
+        columns: [
+          col({ name: 'b', originalName: 'b', dataType: 'integer', autoIncrement: true }),
+          col({ name: 'a', originalName: 'a', dataType: 'integer' }),
+        ],
+      },
+      pgCtx,
+    );
+    assert.ok(plan.warnings.some((w) => w.includes('列顺序')), JSON.stringify(plan.warnings));
+    assert.ok(plan.warnings.some((w) => w.includes('自增')), JSON.stringify(plan.warnings));
+  });
+
+  await checkAsync('PG：库 / schema 属性变更，清空注释用 IS NULL，改名在最后', async () => {
+    const schemaPlan = pgStructure.buildPgDatabasePlan(
+      {
+        target: { kind: 'schema', name: 'public', database: 'app' },
+        label: 'Schema',
+        properties: [
+          { key: 'name', label: 'Schema 名', value: 'public', kind: 'text' },
+          { key: 'owner', label: '所有者', value: 'postgres', kind: 'select' },
+          { key: 'comment', label: '注释', value: '旧', kind: 'text' },
+        ],
+        limitations: [],
+      },
+      {
+        target: { kind: 'schema', name: 'public', database: 'app' },
+        properties: { name: 'app', owner: 'app', comment: '' },
+      },
+    );
+    assert.ok(schemaPlan.statements.includes('ALTER SCHEMA "public" OWNER TO "app";'), schemaPlan.statements.join('|'));
+    assert.ok(schemaPlan.statements.includes('COMMENT ON SCHEMA "public" IS NULL;'), schemaPlan.statements.join('|'));
+    assert.strictEqual(schemaPlan.statements[schemaPlan.statements.length - 1], 'ALTER SCHEMA "public" RENAME TO "app";');
+
+    const dbPlan = pgStructure.buildPgDatabasePlan(
+      {
+        target: { kind: 'database', name: 'app' },
+        label: '数据库',
+        properties: [{ key: 'comment', label: '注释', value: '', kind: 'text' }],
+        limitations: [],
+      },
+      { target: { kind: 'database', name: 'app' }, properties: { comment: '生产库' } },
+    );
+    assert.deepStrictEqual(dbPlan.statements, ["COMMENT ON DATABASE \"app\" IS '生产库';"]);
+  });
+
+  check('PG：驱动声明支持结构编辑，界面据此决定是否给出入口', () => {
+    const pgDefinition = definitions.BUILTIN_DEFINITIONS.find((d) => d.id === 'postgresql');
+    assert.strictEqual(pgDefinition.capabilities.editTableStructure, true);
+    assert.strictEqual(pgDefinition.capabilities.editDatabaseProperties, true);
+    const mysqlDefinition = definitions.BUILTIN_DEFINITIONS.find((d) => d.id === 'mysql');
+    assert.strictEqual(mysqlDefinition.capabilities.editTableStructure, true);
+    assert.strictEqual(mysqlDefinition.capabilities.editDatabaseProperties, true);
+  });
+
   console.log(`\n=========================================`);
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项`);
   if (failures.length) {

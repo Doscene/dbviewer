@@ -15,12 +15,21 @@ import { ConnectionInput, ConnectionStore } from '../core/connectionStore';
 import { DriverRegistry } from '../core/driverRegistry';
 import { EditTarget, resolveEditTarget } from '../core/editTarget';
 import { ExportFormat } from '../core/exporters';
+import { planIsEmpty } from '../core/objectEditor';
 import { isDestructiveStatement } from '../core/sqlText';
+import {
+  collectTableDataTargets,
+  TableDataNodeLike,
+  TableDataTarget,
+  tableDataPanelKey,
+  tableDataPanelTitle,
+} from '../core/tableTargets';
 import {
   ConnectionProfile,
   CreateDatabaseOptions,
   CreateUserRequest,
   DatabaseError,
+  DatabaseObjectTarget,
   GrantRequest,
   IDatabaseDriver,
   QueryResult,
@@ -32,6 +41,12 @@ import { registerBackupCommands } from './backup';
 import { DbTreeItem } from '../views/connectionsTree';
 import { ConnectionFormHost, ConnectionFormPanel, ConnectionFormValues } from '../views/connectionFormPanel';
 import { ManagementFormPanel, ManagementFormValues } from '../views/managementFormPanel';
+import {
+  ObjectEditorChange,
+  ObjectEditorHost,
+  ObjectEditorModel,
+  ObjectEditorPanel,
+} from '../views/objectEditorPanel';
 import { ResultPanel } from '../views/resultPanel';
 import { ShellExecutionOutcome, SqlShellPanel } from '../views/sqlShellPanel';
 
@@ -257,32 +272,15 @@ export function registerCommands(deps: CommandDeps): vscode.Disposable[] {
 
   // ------------------------------------------------------------ 表操作
 
-  register('dbviewer.showTableData', async (node: DbTreeItem) => {
-    const payload = node?.payload;
-    if (!payload?.table || !payload.profileId) {
+  register('dbviewer.showTableData', async (node?: DbTreeItem, selected?: DbTreeItem[]) => {
+    // 多选时 VS Code 把「右键点中的那一项」放在第一个参数、全部选中项放在第二个参数，
+    // 与备份命令同一套规则（见 commands/backup.ts 的 pickNodes）
+    const collected = collectTableDataTargets(pickTableDataNodes(node, selected));
+    if (collected.targets.length === 0) {
+      // 空参（命令面板 / 测试路径）或选中的全是列、库之类的非表节点：静默返回
       return;
     }
-    const session = await manager.connect(payload.profileId);
-    const driver = session.session.driver;
-    if (!driver) {
-      return;
-    }
-    const limit = manager.pageSize || 200;
-    const target: QueryTarget & { table: string } = {
-      database: payload.database,
-      schema: payload.schema,
-      table: payload.table,
-    };
-    const sql =
-      driver.previewSql?.(target, limit) ??
-      `SELECT * FROM ${payload.table} LIMIT ${limit};`;
-    // 表数据预览是最常见的编辑场景，这里直接把目标表交给结果面板，
-    // 不依赖从 SQL 文本反推表名
-    await runSql(sql, deps, payload.profileId, `${payload.schema ?? payload.database ?? ''}.${payload.table}`, {
-      database: payload.database ?? (driver.capabilities.schemas ? undefined : session.session.profile.database),
-      schema: payload.schema,
-      table: payload.table,
-    });
+    await openTableData(deps, collected.targets);
   });
 
   register('dbviewer.showTableDdl', async (node: DbTreeItem) => {
@@ -499,6 +497,40 @@ export function registerCommands(deps: CommandDeps): vscode.Disposable[] {
     }
   });
 
+  // ------------------------------------------------------------ 对象属性编辑
+
+  // 表结构与库属性分成两条命令：菜单里要给出各自明确的名字，
+  // 合并成「编辑属性」再在命令里猜对象类型，标签只能写成含糊的「编辑…」
+  register('dbviewer.editTableStructure', async (node: DbTreeItem) => {
+    const payload = node?.payload;
+    if (!payload?.table || !payload.profileId || payload.tableKind === 'view') {
+      return;
+    }
+    await openObjectEditor(deps, payload.profileId, {
+      mode: 'table',
+      target: { database: payload.database, schema: payload.schema, table: payload.table },
+    });
+  });
+
+  register('dbviewer.editDatabaseProperties', async (node: DbTreeItem) => {
+    const payload = node?.payload;
+    if (!payload?.profileId) {
+      return;
+    }
+    // 库节点与 schema 节点都要支持：PG 的库级属性（owner / 注释）在库节点上，
+    // 而表挂 schema 之下，用户更常右键到的是 schema
+    const target: DatabaseObjectTarget | undefined =
+      payload.kind === 'schema' && payload.schema
+        ? { kind: 'schema', name: payload.schema, database: payload.database }
+        : payload.kind === 'database' && payload.database
+          ? { kind: 'database', name: payload.database }
+          : undefined;
+    if (!target) {
+      return;
+    }
+    await openObjectEditor(deps, payload.profileId, { mode: 'database', target });
+  });
+
   // ------------------------------------------------------------ 环境诊断
 
   register('dbviewer.showEnvironment', async () => {
@@ -600,53 +632,99 @@ async function confirmDestructive(sql: string): Promise<boolean> {
   return answer === '执行';
 }
 
+/** 执行 SQL 的可选行为：表数据预览与批量入口靠它调整进度、报错与窗口归属。 */
+interface RunSqlOptions {
+  profileId?: string;
+  /** 面板头部展示的目标文本（表数据预览 = 库.表）。缺省为「连接名/库名」。 */
+  target?: string;
+  /** 窗口标签标题；缺省「查询结果」。 */
+  title?: string;
+  /** 面板复用键：同键复用同一个窗口（表数据预览靠它做到一表一窗）。 */
+  panelKey?: string;
+  /** 批量开窗时置 true：新窗口不抢焦点。 */
+  preserveFocus?: boolean;
+  /** 已知目标表时直接传入，比从 SQL 文本反推可靠。 */
+  editFallback?: QueryTarget & { table: string };
+  /** 进度通知文案；`null` 表示由调用方统一显示进度（批量入口）。 */
+  progressTitle?: string | null;
+  /** 失败是否弹提示；批量入口置 `false`，自己汇总成一条。 */
+  notifyError?: boolean;
+  /** 是否刷新树；批量入口置 `false`，整批结束后刷一次。 */
+  refreshTree?: boolean;
+}
+
+/** 单次执行的结局：批量入口靠它决定要不要汇总报错。 */
+type RunSqlOutcome =
+  | { status: 'ok' }
+  | { status: 'failed'; profileId: string; message: string }
+  | { status: 'skipped' };
+
 /**
  * 执行 SQL：解析目标连接 → 危险语句确认 → 执行 → 渲染结果。
  *
  * `editFallback` 由调用方在已知目标表时传入（树视图的「查看数据」），
  * 比从 SQL 里推导更可靠；临时 SELECT 则自动尝试推导，推不出来就结果只读。
  */
-async function runSql(
-  sql: string,
-  deps: CommandDeps,
-  profileId?: string,
-  target?: string,
-  editFallback?: QueryTarget & { table: string },
-): Promise<void> {
+async function runSql(sql: string, deps: CommandDeps, options: RunSqlOptions = {}): Promise<RunSqlOutcome> {
   const { manager, store, refreshTree } = deps;
   const text = sql.trim();
   if (!text) {
     vscode.window.showWarningMessage('SQL 为空');
-    return;
+    return { status: 'skipped' };
   }
 
-  const resolvedId = profileId ?? (await resolveTargetProfileId(deps));
+  const resolvedId = options.profileId ?? (await resolveTargetProfileId(deps));
   if (!resolvedId) {
-    return;
+    return { status: 'skipped' };
   }
   const profile = store.get(resolvedId);
   if (!profile) {
-    return;
+    return { status: 'skipped' };
   }
 
   if (!(await confirmDestructive(text))) {
-    return;
+    return { status: 'skipped' };
   }
 
-  const panel = ResultPanel.show(deps.context.extensionUri, vscode.ViewColumn.Beside);
+  const panel = ResultPanel.show(deps.context.extensionUri, {
+    key: options.panelKey,
+    title: options.title,
+    viewColumn: vscode.ViewColumn.Beside,
+    preserveFocus: options.preserveFocus,
+  });
   panel.showRunning(text);
 
   try {
-    const result = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: '正在执行 SQL…', cancellable: false },
-      () => manager.execute(resolvedId, text),
-    );
-    refreshTree();
+    // 批量入口自己显示一条覆盖整批的进度（progressTitle === null）；否则 N 张表会
+    // 依次弹出 N 条「正在执行 SQL…」，把通知中心刷满
+    const result =
+      options.progressTitle === null
+        ? await manager.execute(resolvedId, text)
+        : await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: options.progressTitle ?? '正在执行 SQL…',
+              cancellable: false,
+            },
+            () => manager.execute(resolvedId, text),
+          );
+    if (options.refreshTree !== false) {
+      refreshTree();
+    }
 
-    const edit = await deriveEditTarget(manager, resolvedId, result, editFallback);
+    const edit = await deriveEditTarget(manager, resolvedId, result, options.editFallback);
+    // 面板里改完 SQL 直接执行：复用同一条链路（危险语句确认、超时、错误翻译照旧）并留在
+    // 同一个窗口；批量开窗用的静默报错与「由外层显示进度」不外溢到交互式重跑
+    const rerun: RunSqlOptions = {
+      ...options,
+      progressTitle: undefined,
+      notifyError: true,
+      preserveFocus: false,
+      refreshTree: true,
+    };
     panel.update(result, {
       connectionName: profile.name,
-      target: target ?? `${profile.name}${profile.database ? `/${profile.database}` : ''}`,
+      target: options.target ?? `${profile.name}${profile.database ? `/${profile.database}` : ''}`,
       edit,
       applyEdit: edit
         ? ({ identity, changes }) =>
@@ -660,25 +738,178 @@ async function runSql(
               changes,
             })
         : undefined,
-      // 面板里改完 SQL 直接执行：复用同一条链路，危险语句确认、超时、错误翻译
-      // 全部照旧生效，也不会把结果集换成另一个连接的
-      executeSql: (nextSql) => runSql(nextSql, deps, resolvedId, target, editFallback),
+      executeSql: async (nextSql) => {
+        await runSql(nextSql, deps, rerun);
+      },
     });
+    return { status: 'ok' };
   } catch (err) {
-    refreshTree();
+    if (options.refreshTree !== false) {
+      refreshTree();
+    }
     const message = (err as Error).message;
     panel.showError(message, text);
-    const suggestions = manager.resolver.suggestions(profile.host);
-    const action = await vscode.window.showErrorMessage(
-      `执行失败：${message.split('\n')[0]}`,
-      ...(suggestions.length ? ['查看排查建议'] : []),
-    );
-    if (action === '查看排查建议') {
-      deps.output.appendLine('--------------------------------------------------------------');
-      deps.output.appendLine(suggestions.map((s) => `· ${s}`).join('\n'));
-      deps.output.show(true);
+    // 批量入口不在这里弹提示：N 张表各弹一次会把界面刷满，由调用方汇总成一条
+    if (options.notifyError !== false) {
+      const suggestions = manager.resolver.suggestions(profile.host);
+      const action = await vscode.window.showErrorMessage(
+        `执行失败：${message.split('\n')[0]}`,
+        ...(suggestions.length ? ['查看排查建议'] : []),
+      );
+      if (action === '查看排查建议') {
+        deps.output.appendLine('--------------------------------------------------------------');
+        deps.output.appendLine(suggestions.map((s) => `· ${s}`).join('\n'));
+        deps.output.show(true);
+      }
     }
+    return { status: 'failed', profileId: resolvedId, message };
   }
+}
+
+/**
+ * 打开「查看数据」窗口：一张表一个窗口，多选时按顺序逐个读取。
+ *
+ * 顺序而不是并发：驱动是单连接（`mysql.createConnection` / `new Client`），并发只会让
+ * 排队语义、超时判定与错误归属变复杂；顺序读取也让进度能准确说清「读到第几张」。
+ */
+async function openTableData(deps: CommandDeps, targets: TableDataTarget[]): Promise<void> {
+  const { manager, refreshTree } = deps;
+  const multiple = targets.length > 1;
+  const failures: Array<{ title: string; message: string; profileId: string }> = [];
+  let cancelled = false;
+
+  const openOne = async (target: TableDataTarget, index: number): Promise<void> => {
+    const title = tableDataPanelTitle(target);
+    let driver: IDatabaseDriver | undefined;
+    let sessionDatabase: string | undefined;
+    try {
+      const session = await manager.connect(target.profileId);
+      driver = session.session.driver;
+      sessionDatabase = session.session.profile.database;
+    } catch (err) {
+      // 连接失败只影响这一张表：剩下的照常开窗，最后汇总成一条提示
+      failures.push({ title, message: (err as Error).message, profileId: target.profileId });
+      return;
+    }
+    if (!driver) {
+      failures.push({ title, message: '连接未就绪', profileId: target.profileId });
+      return;
+    }
+
+    const limit = manager.pageSize || 200;
+    const query: QueryTarget & { table: string } = {
+      database: target.database,
+      schema: target.schema,
+      table: target.table,
+    };
+    const sql = driver.previewSql?.(query, limit) ?? `SELECT * FROM ${target.table} LIMIT ${limit};`;
+    const outcome = await runSql(sql, deps, {
+      profileId: target.profileId,
+      // 窗口标题与头部目标都写「库.表」：多窗口并存时，标签是唯一能一眼分清身份的线索
+      title,
+      target: title,
+      panelKey: tableDataPanelKey(target),
+      preserveFocus: multiple && index > 0,
+      // 表数据预览是最常见的编辑场景，这里直接把目标表交给结果面板，
+      // 不依赖从 SQL 文本反推表名
+      editFallback: {
+        database: target.database ?? (driver.capabilities.schemas ? undefined : sessionDatabase),
+        schema: target.schema,
+        table: target.table,
+      },
+      // 多选时进度与报错都由本函数统一处理，避免 N 条通知刷屏
+      progressTitle: multiple ? null : undefined,
+      notifyError: !multiple,
+      refreshTree: !multiple,
+    });
+    if (outcome.status === 'failed') {
+      failures.push({ title, message: outcome.message, profileId: outcome.profileId });
+    }
+  };
+
+  if (!multiple) {
+    await openOne(targets[0], 0);
+  } else {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `正在读取 ${targets.length} 张数据表…`,
+        cancellable: true,
+      },
+      async (progress, token) => {
+        for (let i = 0; i < targets.length; i += 1) {
+          if (token.isCancellationRequested) {
+            cancelled = true;
+            break;
+          }
+          progress.report({
+            message: `${i + 1}/${targets.length} · ${tableDataPanelTitle(targets[i])}`,
+            increment: 100 / targets.length,
+          });
+          await openOne(targets[i], i);
+        }
+      },
+    );
+    // 整批只刷一次树：逐条刷会在选中几十张表时打出几十个刷新事件
+    refreshTree();
+  }
+
+  if (cancelled) {
+    vscode.window.setStatusBarMessage('已取消：剩余数据表未读取', 4000);
+  }
+  if (failures.length) {
+    await reportBatchFailures(deps, failures);
+  }
+}
+
+/**
+ * 批量「查看数据」的失败汇总。
+ *
+ * 失败的那张表已经在自己的窗口里渲染了错误；界面只再弹一条，明细写进输出通道 ——
+ * 选了 20 张表就弹 20 个错误提示的话，用户除了把它们逐个关掉什么也做不了。
+ */
+async function reportBatchFailures(
+  deps: CommandDeps,
+  failures: Array<{ title: string; message: string; profileId: string }>,
+): Promise<void> {
+  const { store, manager, output } = deps;
+  output.appendLine('--------------------------------------------------------------');
+  output.appendLine(`[查看数据] ${failures.length} 张表读取失败：`);
+  output.appendLine(failures.map((f) => `· ${f.title}：${f.message.split('\n')[0]}`).join('\n'));
+
+  const first = failures[0];
+  const profile = store.get(first.profileId);
+  const suggestions = profile ? manager.resolver.suggestions(profile.host) : [];
+  const action = await vscode.window.showErrorMessage(
+    `${failures.length} 张表读取失败：${first.title}（${first.message.split('\n')[0]}）`,
+    '查看日志',
+    ...(suggestions.length ? ['查看排查建议'] : []),
+  );
+  if (action === '查看日志') {
+    output.show(true);
+  } else if (action === '查看排查建议') {
+    output.appendLine(suggestions.map((s) => `· ${s}`).join('\n'));
+    output.show(true);
+  }
+}
+
+/**
+ * 树节点 → 「查看数据」目标。
+ *
+ * 与备份命令同一套多选规则：右键点中的项若不在选中集合里就补到最前 ——
+ * 那才是用户当下的意图；已在集合里就不要重复计入。
+ */
+function pickTableDataNodes(node?: DbTreeItem, selected?: DbTreeItem[]): TableDataNodeLike[] {
+  const list = (selected ?? []).filter(Boolean);
+  const effective = node && !list.includes(node) ? [node, ...list] : list.length ? list : node ? [node] : [];
+  return effective.map((item) => ({
+    kind: item.payload?.kind,
+    profileId: item.payload?.profileId,
+    database: item.payload?.database,
+    schema: item.payload?.schema,
+    table: item.payload?.table,
+    tableKind: item.payload?.tableKind,
+  }));
 }
 
 /**
@@ -842,6 +1073,135 @@ function requireDriver(manager: ConnectionManager, profileId: string): IDatabase
     throw new DatabaseError('连接未就绪，请重新连接后重试', 'ENOT_CONNECTED');
   }
   return driver;
+}
+
+/** 对象编辑器要编辑的东西：表结构或库 / schema 属性。 */
+type ObjectEditorRequest =
+  | { mode: 'table'; target: QueryTarget & { table: string } }
+  | { mode: 'database'; target: DatabaseObjectTarget };
+
+/**
+ * 打开对象编辑器。
+ *
+ * 只在这里做「读现状 → 生成语句 → 应用」的编排，真正的差异计算与 DDL 拼装都在驱动层：
+ * 命令层一旦开始按驱动拼 SQL，第三个数据库接进来时就得改这里。
+ */
+async function openObjectEditor(deps: CommandDeps, profileId: string, request: ObjectEditorRequest): Promise<void> {
+  const { manager, store, refreshTree } = deps;
+  const profile = store.get(profileId);
+  if (!profile) {
+    return;
+  }
+
+  let connected: ConnectResult;
+  try {
+    connected = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: '正在读取对象结构…', cancellable: false },
+      () => manager.connect(profileId),
+    );
+  } catch (err) {
+    refreshTree();
+    await reportConnectionError(err, deps, profileId);
+    return;
+  }
+
+  const driver = connected.session.driver;
+  if (!driver) {
+    vscode.window.showWarningMessage('连接未就绪，无法读取对象结构');
+    return;
+  }
+
+  const isTable = request.mode === 'table';
+  // 能力位与实现都要检查：能力位是驱动自己声明的，第三方驱动可能声明了却没实现
+  const capable = isTable
+    ? driver.capabilities.editTableStructure && typeof driver.describeTable === 'function'
+    : driver.capabilities.editDatabaseProperties && typeof driver.describeDatabaseProperties === 'function';
+  if (!capable) {
+    vscode.window.showWarningMessage(
+      `驱动「${driver.displayName}」不支持${isTable ? '编辑表结构' : '编辑数据库属性'}`,
+    );
+    return;
+  }
+
+  const tableTarget = request.mode === 'table' ? request.target : undefined;
+  const databaseTarget = request.mode === 'database' ? request.target : undefined;
+  const connectionLabel = `${profile.name} · ${driver.displayName}`;
+
+  const load = async (): Promise<ObjectEditorModel> => {
+    if (tableTarget) {
+      const structure = await driver.describeTable!(tableTarget);
+      return {
+        mode: 'table',
+        title: tableDataPanelTitle(tableTarget),
+        objectLabel: '数据表',
+        connectionLabel,
+        properties: structure.properties,
+        columns: structure.columns,
+        dataTypes: structure.dataTypes,
+        allowReorder: structure.allowReorder,
+        allowAutoIncrement: structure.allowAutoIncrement,
+        limitations: structure.limitations,
+        ddl: structure.ddl,
+        readOnly: !!connected.session.profile.readOnly,
+      };
+    }
+    const described = await driver.describeDatabaseProperties!(databaseTarget!);
+    return {
+      mode: 'database',
+      title: databaseTarget!.name,
+      objectLabel: described.label,
+      connectionLabel,
+      properties: described.properties,
+      allowReorder: false,
+      allowAutoIncrement: false,
+      limitations: described.limitations,
+      readOnly: !!connected.session.profile.readOnly,
+    };
+  };
+
+  /**
+   * 生成计划。
+   *
+   * 预览与应用共用它，且每次都让驱动重读现状——面板里的「原始值」只用于渲染，
+   * 绝不能作为生成 DDL 的依据，否则面板停留久了就会按过期结构下发语句。
+   */
+  const generate = async (change: ObjectEditorChange) => {
+    const properties = change.properties ?? {};
+    if (tableTarget) {
+      return driver.planTableChange!({ target: tableTarget, columns: change.columns ?? [], properties });
+    }
+    return driver.planDatabaseChange!({ target: databaseTarget!, properties });
+  };
+
+  const host: ObjectEditorHost = {
+    load,
+    plan: generate,
+    apply: async (change) => {
+      const plan = await generate(change);
+      if (planIsEmpty(plan)) {
+        throw new Error('没有检测到任何变更');
+      }
+      // 结构变更的破坏性不比 DELETE 小（删列直接丢数据），复用同一套二次确认
+      if (!(await confirmDestructive(plan.statements.join(';\n')))) {
+        return undefined;
+      }
+      const result = tableTarget
+        ? await driver.applyTableChange!({ target: tableTarget, columns: change.columns ?? [], properties: change.properties ?? {} })
+        : await driver.applyDatabaseChange!({ target: databaseTarget!, properties: change.properties ?? {} });
+      refreshTree();
+      vscode.window.setStatusBarMessage(`已执行 ${result.executed} 条语句`, 4000);
+      return result;
+    },
+  };
+
+  try {
+    const model = await load();
+    ObjectEditorPanel.open(deps.context.extensionUri, host, model, {
+      icon: isTable ? 'table' : 'database',
+    });
+  } catch (err) {
+    vscode.window.showErrorMessage(`读取对象结构失败：${(err as Error).message}`);
+  }
 }
 
 /** 确定 SQL 应发往哪个连接：优先文档绑定，其次让用户选择。 */async function resolveTargetProfileId(deps: CommandDeps): Promise<string | undefined> {

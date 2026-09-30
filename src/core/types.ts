@@ -119,6 +119,139 @@ export interface CellUpdateResult {
   affectedRows: number;
 }
 
+// ---------------------------------------------------------------- 对象属性编辑
+
+/** 属性对应的界面控件类型。 */
+export type EditablePropertyKind = 'text' | 'number' | 'select' | 'textarea' | 'switch';
+
+/**
+ * 一条可编辑属性（表级选项 / 库级选项）。
+ *
+ * 为什么以数据形式下发而不是在面板里写死字段：各家数据库能改的东西差别极大
+ * （MySQL 有 ENGINE / 字符集 / 排序规则，PostgreSQL 只有属主与注释），
+ * 声明式下发后，新增驱动不需要改任何界面代码，也不会出现「界面显示了但驱动不认」。
+ *
+ * 约定：
+ * - 键名 `name` 保留给「对象名」（表名 / 库名 / schema 名），命令层据此识别重命名；
+ * - `kind === 'switch'` 的取值统一为 `'1'` / `'0'`（差异比较是字符串比较，
+ *   界面按 `'1'` 回传，驱动不要用 `'true'` 之类的写法，否则「没动过」也会被判成有变化）。
+ */
+export interface EditableProperty {
+  key: string;
+  label: string;
+  value: string;
+  kind: EditablePropertyKind;
+  /** `kind === 'select'` 时的候选值。 */
+  options?: string[];
+  placeholder?: string;
+  hint?: string;
+  /** false 表示仅展示不可改（例如 PostgreSQL 的库编码）。 */
+  editable?: boolean;
+}
+
+/**
+ * 列定义：既是读回来的现状，也是提交回去的目标状态。
+ *
+ * `originalName` 是「这一行原本是哪一列」的唯一凭据：没有它就无法区分
+ * 「把 a 改名成 b」与「删掉 a、新增 b」，而后者会连同列上的数据一起丢掉。
+ * 因此它只由驱动读回来的结果填充，界面只负责原样回传。
+ */
+export interface TableColumnDefinition {
+  name: string;
+  /** 完整类型文本，如 `varchar(255)` / `character varying(255)`。 */
+  dataType: string;
+  nullable: boolean;
+  /** 默认值表达式原文；`null` / 缺省表示没有默认值。 */
+  defaultValue?: string | null;
+  comment?: string;
+  isPrimaryKey?: boolean;
+  autoIncrement?: boolean;
+  /** 读回来的原始列名；新增列为空。 */
+  originalName?: string;
+  /**
+   * 驱动读回、必须原样保留的额外列子句（MySQL 的 `ON UPDATE CURRENT_TIMESTAMP`）。
+   *
+   * 单列一个字段的理由：这种子句不体现在类型 / 默认值 / 可空里，改写别的属性时一旦漏掉，
+   * 就是**静默改变表行为**（时间戳列不再自动更新），而服务端一句话都不会报。
+   * 界面不解释它的语义，只负责原样带回。
+   */
+  extraClauses?: string;
+  /** 读回来的位置（从 1 开始），仅用于界面展示与列序比较。 */
+  ordinal?: number;
+}
+
+/** 表结构描述（`IDatabaseDriver.describeTable` 的返回值）。 */
+export interface TableStructure {
+  target: QueryTarget & { table: string };
+  columns: TableColumnDefinition[];
+  /** 表级可编辑属性（含名为 `name` 的对象名属性）。 */
+  properties: EditableProperty[];
+  /** 数据类型候选；为空表示由用户自由填写。 */
+  dataTypes?: string[];
+  /** 界面无法提供的编辑能力及原因，直接展示给用户。 */
+  limitations: string[];
+  /** 是否支持调整列顺序（PostgreSQL 的列序由物理位置决定，没有 AFTER 语义）。 */
+  allowReorder: boolean;
+  /** 是否支持切换自增（PostgreSQL 的既有列无法就地转成 serial）。 */
+  allowAutoIncrement: boolean;
+  /** 驱动给的建表语句，供用户在应用前核对。 */
+  ddl?: string;
+}
+
+/** 库 / schema 定位（树视图层级里没有「数据库」节点的驱动用 schema 代替）。 */
+export interface DatabaseObjectTarget {
+  /** MySQL：数据库名；PostgreSQL：schema 名。 */
+  name: string;
+  kind: 'database' | 'schema';
+  /** 所属数据库（PostgreSQL 的 schema 挂在库下；MySQL 忽略）。 */
+  database?: string;
+}
+
+/** 库 / schema 属性描述。 */
+export interface DatabaseProperties {
+  target: DatabaseObjectTarget;
+  /** 对象类别文案：数据库 / Schema。 */
+  label: string;
+  properties: EditableProperty[];
+  limitations: string[];
+}
+
+/** 表结构变更请求：只描述目标状态，现状由驱动自己重读。 */
+export interface TableChangeRequest {
+  target: QueryTarget & { table: string };
+  /** 目标列定义，顺序即目标列序。 */
+  columns: TableColumnDefinition[];
+  /** 表级属性的目标值，键同 `TableStructure.properties[].key`。 */
+  properties: Record<string, string>;
+}
+
+/** 库 / schema 属性变更请求。 */
+export interface DatabaseChangeRequest {
+  target: DatabaseObjectTarget;
+  properties: Record<string, string>;
+}
+
+/**
+ * 变更计划。
+ *
+ * 预览与实际执行共用同一份语句：分开生成迟早会出现「预览说会这么改、执行却改了别的」，
+ * 而结构变更恰恰是最不能靠猜的一类操作。
+ */
+export interface ObjectChangePlan {
+  /** 待下发的语句，按执行顺序排列。空数组表示没有任何变更。 */
+  statements: string[];
+  /** 人类可读的变更摘要（新增列 a、删除列 b…）。 */
+  changes: string[];
+  /** 被跳过的变更及原因（该数据库不支持、需要手工处理等）。 */
+  warnings?: string[];
+}
+
+/** 变更执行结果。 */
+export interface ObjectChangeResult extends ObjectChangePlan {
+  /** 实际执行成功的语句数；小于 `statements.length` 说明中途失败。 */
+  executed: number;
+}
+
 export interface DriverCapabilities {
   /** 支持列级元数据浏览。 */
   columns: boolean;
@@ -130,6 +263,10 @@ export interface DriverCapabilities {
   multiStatement: boolean;
   /** 支持结果表格编辑（需要能依据主键生成单行 UPDATE）。 */
   editable: boolean;
+  /** 支持编辑表结构（增删改列、调整列序、表级属性）。 */
+  editTableStructure: boolean;
+  /** 支持编辑数据库 / schema 级别的属性。 */
+  editDatabaseProperties: boolean;
   /** 支持删除表 / 数据库等管理操作。 */
   manageDatabase: boolean;
   /** 支持创建用户与授权。 */
@@ -183,6 +320,26 @@ export interface IDatabaseDriver {
    * 驱动运行在子进程，任何同步方法都无法跨进程调用。
    */
   updateCell?(request: CellUpdateRequest, options: ExecuteOptions): Promise<CellUpdateResult>;
+
+  /** 读取表结构（列、主键、表级属性）；`capabilities.editTableStructure` 为 true 时实现。 */
+  describeTable?(target: QueryTarget & { table: string }): Promise<TableStructure>;
+  /** 生成表结构变更语句，不执行——界面的「预览」入口走这里。 */
+  planTableChange?(request: TableChangeRequest): Promise<ObjectChangePlan>;
+  /**
+   * 应用表结构变更。`capabilities.editTableStructure` 为 true 时实现。
+   *
+   * 与 `updateCell` 同一个理由：语句生成与执行都在驱动层完成。列定义怎么拼、
+   * 位置子句怎么写、主键怎么删了重建，全都是方言知识，通用层拼装必然出错；
+   * 而且该接口必须是异步的，sidecar 模式下同步方法无法跨进程调用。
+   */
+  applyTableChange?(request: TableChangeRequest): Promise<ObjectChangeResult>;
+
+  /** 读取库 / schema 属性；`capabilities.editDatabaseProperties` 为 true 时实现。 */
+  describeDatabaseProperties?(target: DatabaseObjectTarget): Promise<DatabaseProperties>;
+  /** 生成库 / schema 属性变更语句，不执行。 */
+  planDatabaseChange?(request: DatabaseChangeRequest): Promise<ObjectChangePlan>;
+  /** 应用库 / schema 属性变更。 */
+  applyDatabaseChange?(request: DatabaseChangeRequest): Promise<ObjectChangeResult>;
 
   /** 删除数据表；`capabilities.manageDatabase` 为 true 时实现。 */
   dropTable?(target: QueryTarget & { table: string }): Promise<void>;
