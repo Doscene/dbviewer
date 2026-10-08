@@ -150,6 +150,16 @@ export interface EditableProperty {
 }
 
 /**
+ * 默认值的语义。
+ *
+ * 为什么要在文本之外单独给一个语义位：默认值文本本身是歧义的 —— MySQL 的 `now()`
+ * 既可能是「字面量字符串」也可能是「函数调用」，PG 的 `'abc'::character varying`
+ * 又只能按表达式原样写回。只靠文本形态推断，界面就没法表达「这就是个常量」。
+ * 缺省（未触碰）时驱动仍按文本形态推断，第三方调用方与旧行为不受影响。
+ */
+export type DefaultKind = 'none' | 'constant' | 'expression';
+
+/**
  * 列定义：既是读回来的现状，也是提交回去的目标状态。
  *
  * `originalName` 是「这一行原本是哪一列」的唯一凭据：没有它就无法区分
@@ -163,6 +173,11 @@ export interface TableColumnDefinition {
   nullable: boolean;
   /** 默认值表达式原文；`null` / 缺省表示没有默认值。 */
   defaultValue?: string | null;
+  /**
+   * 界面显式声明的默认值语义；缺省表示「用户没动过」，驱动按文本形态推断
+   * （见 `DefaultKind` 的说明）。
+   */
+  defaultKind?: DefaultKind;
   comment?: string;
   isPrimaryKey?: boolean;
   autoIncrement?: boolean;
@@ -194,6 +209,13 @@ export interface TableStructure {
   allowReorder: boolean;
   /** 是否支持切换自增（PostgreSQL 的既有列无法就地转成 serial）。 */
   allowAutoIncrement: boolean;
+  /**
+   * 是否支持 `ON UPDATE CURRENT_TIMESTAMP` 开关（目前只有 MySQL）。
+   *
+   * 与 `allowReorder` 同样是「驱动给界面的数据」：视图层据此决定要不要渲染开关，
+   * 不得按驱动名分支。缺省视为不支持。
+   */
+  allowAutoUpdate?: boolean;
   /** 驱动给的建表语句，供用户在应用前核对。 */
   ddl?: string;
 }

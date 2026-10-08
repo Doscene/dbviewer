@@ -12,13 +12,13 @@ import {
   diffPrimaryKey,
   diffProperties,
   diffTableColumns,
-  normalizeDefaultText,
   normalizeTypeText,
   propertyChangeValue,
   summarizeColumnsDiff,
   validateColumnDefinitions,
   validateObjectName,
 } from '../core/objectEditor';
+import { defaultSignature } from '../core/columnSpecs';
 import { mysqlQualified, quoteMysqlIdent, quoteMysqlString } from '../core/sqlText';
 import {
   DatabaseChangeRequest,
@@ -61,6 +61,10 @@ export const MYSQL_COLUMN_TYPES = [
 /** 默认值需要补引号的类型：这些类型的 `COLUMN_DEFAULT` 是不带引号的裸文本。 */
 const QUOTED_DEFAULT_TYPE_RE =
   /(char|varchar|text|enum|set|date|time|timestamp|year|binary|varbinary|blob|json|geometry)/i;
+
+/** 数值列：「常量」语义下数字可以裸写，其余类型必须进字符串字面量。 */
+const NUMERIC_COLUMN_TYPE_RE =
+  /^(tinyint|smallint|mediumint|int|integer|bigint|decimal|numeric|dec|fixed|float|double|real|bit|year|bool|boolean)(\b|\()/i;
 
 /** MySQL 里可以不加括号写的默认值关键字。 */
 const BARE_DEFAULT_KEYWORDS_RE =
@@ -318,6 +322,10 @@ export function renderMysqlColumn(column: TableColumnDefinition): string {
  *    （`DEFAULT ('hello')` → `_utf8mb4\'hello\'`），原样写回会报语法错误，必须先反转义。
  * 3. MySQL 8 要求表达式默认值写成 `DEFAULT (expr)`（内置时间函数除外），
  *    而 TEXT / BLOB / JSON / GEOMETRY 列**只能**用表达式形式。
+ *
+ * `column.defaultKind` 是界面显式声明的语义：给了就以它为准（`now()` 当常量时不能被
+ * 误当成函数调用，`abc` 当表达式时也不能被补上引号）；没给则按上面的形态推断 ——
+ * 第三方调用方与老行为完全一致。
  */
 export function renderMysqlDefault(column: TableColumnDefinition): string {
   if (column.defaultValue === null || column.defaultValue === undefined) {
@@ -329,6 +337,14 @@ export function renderMysqlDefault(column: TableColumnDefinition): string {
     // 空串默认值与「没有默认值」是两回事，不能合并
     return expressionOnly ? "DEFAULT ('')" : "DEFAULT ''";
   }
+  if (column.defaultKind === 'constant') {
+    return renderMysqlConstant(text, column.dataType, expressionOnly);
+  }
+  if (column.defaultKind === 'expression') {
+    const expression = unescapeMysqlText(text);
+    return isAlreadyWritableExpression(expression) ? `DEFAULT ${expression}` : `DEFAULT (${expression})`;
+  }
+  // —— 以下为「界面没声明语义」的推断路径，逐行保持既有行为 ——
   if (isExpressionDefault(text)) {
     const expression = unescapeMysqlText(text);
     if (isAlreadyWritableExpression(expression)) {
@@ -349,6 +365,23 @@ export function renderMysqlDefault(column: TableColumnDefinition): string {
     return `DEFAULT ${text}`;
   }
   return `DEFAULT (${text})`;
+}
+
+/**
+ * 「常量」语义下的默认值：数值列上的数字裸写，其余一律进字符串字面量。
+ *
+ * 一律加引号的理由：用户选的是「常量」，`now()` 这种长得像函数的字面量绝不能被服务端
+ * 当函数执行；反过来，数值列上裸写的 `0755` 在字符串列里会被服务端当成数字 755，
+ * 只有「列类型是数值」时才敢不加引号。
+ * TEXT / BLOB / JSON / GEOMETRY 列只能写表达式形式（MySQL 8.0.13 起），故仍包一层括号。
+ */
+function renderMysqlConstant(text: string, dataType: string, expressionOnly: boolean): string {
+  const numericType = NUMERIC_COLUMN_TYPE_RE.test(normalizeTypeText(dataType));
+  if (numericType && /^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(text)) {
+    return `DEFAULT ${text}`;
+  }
+  const literal = quoteMysqlString(text);
+  return expressionOnly ? `DEFAULT (${literal})` : `DEFAULT ${literal}`;
 }
 
 /** 默认值是否已是完整表达式（字符串字面量、函数调用、时间关键字、字符集引导符）。 */
@@ -409,7 +442,8 @@ export function sameMysqlColumn(a: TableColumnDefinition, b: TableColumnDefiniti
   return (
     normalizeTypeText(a.dataType) === normalizeTypeText(b.dataType) &&
     !!a.nullable === !!b.nullable &&
-    normalizeDefaultText(a.defaultValue) === normalizeDefaultText(b.defaultValue) &&
+    // 默认值要连「语义」一起比：只把常量改成表达式（值没变、渲染结果不同）也是变更
+    defaultSignature(a) === defaultSignature(b) &&
     !!a.autoIncrement === !!b.autoIncrement &&
     // 两边大小写可能不同（服务端给的是 `on update …`，我们拼的是 `ON UPDATE …`）
     (a.extraClauses ?? '').trim().toLowerCase() === (b.extraClauses ?? '').trim().toLowerCase() &&

@@ -12,9 +12,28 @@
 
 import * as vscode from 'vscode';
 
+import {
+  ColumnDefaultEditor,
+  ColumnOnUpdateEditor,
+  ColumnTypeEditor,
+  EditorColumnTarget,
+  TypeOption,
+} from '../core/columnSpecs';
 import { EditableProperty, ObjectChangePlan, ObjectChangeResult, TableColumnDefinition } from '../core/types';
 
 export type ObjectEditorMode = 'table' | 'database';
+
+/**
+ * 面板看到的列定义：在列定义之上挂「结构化的编辑描述」。
+ *
+ * 描述由扩展侧的纯函数（`core/columnSpecs.ts`）算好下发，Webview 只负责渲染控件、
+ * 回传目标状态 —— 类型文本与子句的拼装不落在 JS 里，避免同一份规则两处实现。
+ */
+export interface ColumnEditorView extends TableColumnDefinition {
+  typeEditor: ColumnTypeEditor;
+  defaultEditor: ColumnDefaultEditor;
+  onUpdate: ColumnOnUpdateEditor;
+}
 
 /**
  * 面板模型。
@@ -32,11 +51,13 @@ export interface ObjectEditorModel {
   connectionLabel: string;
   properties: EditableProperty[];
   /** 仅表结构模式：列定义，顺序即目标列序。 */
-  columns?: TableColumnDefinition[];
-  /** 数据类型候选（datalist 提示用）。 */
-  dataTypes?: string[];
+  columns?: ColumnEditorView[];
+  /** 数据类型候选（下拉选项，已归纳成基础类型 + 参数形态）。 */
+  typeOptions?: TypeOption[];
   allowReorder: boolean;
   allowAutoIncrement: boolean;
+  /** 是否提供 `ON UPDATE CURRENT_TIMESTAMP` 开关。 */
+  allowAutoUpdate?: boolean;
   /** 界面无法提供的编辑能力及原因，直接展示。 */
   limitations: string[];
   /** 驱动给出的建表语句，供核对。 */
@@ -49,8 +70,8 @@ export interface ObjectEditorModel {
 export interface ObjectEditorChange {
   /** 属性目标值，键同模型 `properties[].key`。 */
   properties: Record<string, string>;
-  /** 目标列定义（表结构模式）。 */
-  columns?: TableColumnDefinition[];
+  /** 目标列定义（表结构模式）；只有被改过的部分才带结构化目标。 */
+  columns?: EditorColumnTarget[];
 }
 
 /** 面板与扩展侧之间的契约，由命令层实现。 */
@@ -262,7 +283,7 @@ export class ObjectEditorPanel {
         <button type="button" class="secondary" id="addColumn">新增列</button>
       </div>
       <p class="hint" id="columnsHint">
-        改完点「生成 SQL」先看语句；「应用变更」会逐条落库。默认值按 SQL 表达式处理，文本会自动加引号。
+        类型用下拉与参数框填写；无法用控件表达的类型会退回「原始文本」。默认值请选语义：常量只填值，表达式直接写 SQL 片段。
       </p>
       <div class="columns-wrap">
         <table class="columns">
@@ -282,17 +303,13 @@ export class ObjectEditorPanel {
           <tbody id="columns"></tbody>
         </table>
       </div>
-      <datalist id="dataTypes"></datalist>
     </section>
 
-    <section class="card">
-      <div class="card-head">
-        <h2>将要执行的语句</h2>
-        <span class="changes" id="changes"></span>
-      </div>
+    <details class="card" id="sqlCard">
+      <summary>将要执行的语句 <span class="changes" id="changes"></span></summary>
       <pre class="sql-preview" id="sqlPreview">（点「生成 SQL」预览将要下发的语句）</pre>
       <ul class="warnings" id="warnings" hidden></ul>
-    </section>
+    </details>
 
     <details class="card" id="ddlCard" ${model.ddl ? '' : 'hidden'}>
       <summary>当前建表语句（只读，供核对）</summary>

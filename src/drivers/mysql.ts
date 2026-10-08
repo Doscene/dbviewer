@@ -425,6 +425,8 @@ export class MySqlDriver implements IDatabaseDriver {
       ],
       allowReorder: true,
       allowAutoIncrement: true,
+      // ON UPDATE CURRENT_TIMESTAMP 只存在于 EXTRA 里，界面用开关表达它（见 extraClauses）
+      allowAutoUpdate: true,
       ddl: await this.showCreateTable({ database, table: target.table }).catch(() => undefined),
     };
   }

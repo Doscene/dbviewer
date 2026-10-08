@@ -1,6 +1,7 @@
 // 对象属性 / 表结构编辑器前端：纯原生 JS，无外部依赖。
 // 职责边界：只负责渲染模型、收集输入、把「目标状态」回传扩展侧。
-// 差异计算与 DDL 生成全在扩展侧（驱动层），这里不认识任何数据库方言。
+// 差异计算、类型文本拼装与 DDL 生成全在扩展侧（core/columnSpecs.ts + 驱动层），
+// 这里不认识任何数据库方言 —— 连 varchar(255) 这个字符串都不是在这里拼的。
 (function () {
   const vscode = acquireVsCodeApi();
   const model = JSON.parse(document.getElementById('bootstrap').textContent);
@@ -24,8 +25,8 @@
     columns: document.getElementById('columns'),
     columnsHint: document.getElementById('columnsHint'),
     autoIncHead: document.getElementById('autoIncHead'),
-    dataTypes: document.getElementById('dataTypes'),
     addColumn: document.getElementById('addColumn'),
+    sqlCard: document.getElementById('sqlCard'),
     changes: document.getElementById('changes'),
     sqlPreview: document.getElementById('sqlPreview'),
     warnings: document.getElementById('warnings'),
@@ -39,6 +40,19 @@
   };
 
   const isTable = model.mode === 'table';
+
+  /** 参数输入框的占位文案；按扩展侧给的参数形态取。 */
+  const ARG_PLACEHOLDER = {
+    length: '长度',
+    precision: '精度,小数位',
+    seconds: '秒精度 0-6',
+  };
+
+  const DEFAULT_HINT = {
+    none: '不设默认值（可空列即为 NULL）',
+    constant: '只填值，扩展侧会按列类型加引号',
+    expression: '直接写 SQL 片段，如 CURRENT_TIMESTAMP',
+  };
 
   // ------------------------------------------------------------ 事件绑定
 
@@ -107,7 +121,6 @@
 
     renderLimitations(next.limitations || []);
     renderProperties(next.properties || []);
-    renderDataTypes(next.dataTypes || []);
     renderColumns(next.columns || []);
     renderDdl(next.ddl);
 
@@ -116,8 +129,8 @@
     el.autoIncHead.hidden = !next.allowAutoIncrement;
     if (el.columnsHint) {
       el.columnsHint.textContent = next.allowReorder
-        ? '改完点「生成 SQL」先看语句；「应用变更」会逐条落库。默认值按 SQL 表达式处理，文本会自动加引号。'
-        : '本数据库不支持调整列顺序，顺序改动会被忽略。默认值按 SQL 表达式处理。';
+        ? '类型用下拉与参数框填写；无法用控件表达的类型会退回「原始文本」。默认值请选语义：常量只填值，表达式直接写 SQL 片段。'
+        : '本数据库不支持调整列顺序，顺序改动会被忽略。类型无法用控件表达时会退回「原始文本」。';
     }
 
     clearPreview();
@@ -206,15 +219,6 @@
     }
   }
 
-  function renderDataTypes(types) {
-    el.dataTypes.textContent = '';
-    for (const type of types) {
-      const option = document.createElement('option');
-      option.value = type;
-      el.dataTypes.appendChild(option);
-    }
-  }
-
   function renderColumns(columns) {
     el.columns.textContent = '';
     for (const column of columns) {
@@ -235,6 +239,9 @@
     el.changes.textContent = '';
     el.warnings.hidden = true;
     el.warnings.textContent = '';
+    if (el.sqlCard) {
+      el.sqlCard.open = false;
+    }
   }
 
   function renderPlan(plan) {
@@ -249,6 +256,9 @@
       const item = document.createElement('li');
       item.textContent = text;
       el.warnings.appendChild(item);
+    }
+    if (el.sqlCard) {
+      el.sqlCard.open = true;
     }
   }
 
@@ -285,7 +295,7 @@
       control.disabled = busy || readOnly || control.dataset.locked === '1';
     }
     for (const row of el.columns.querySelectorAll('tr')) {
-      for (const control of row.querySelectorAll('input, button')) {
+      for (const control of row.querySelectorAll('input, button, select')) {
         control.disabled = busy || readOnly;
       }
     }
@@ -303,6 +313,10 @@
       comment: '',
       isPrimaryKey: false,
       autoIncrement: false,
+      // 新列没有「原文」可回传，直接进结构化模式并视为已修改
+      typeEditor: { mode: 'structured', raw: '', base: '', args: '', argsKind: 'none', unsigned: false },
+      defaultEditor: { kind: 'none', value: '' },
+      onUpdate: { supported: false, enabled: false },
     };
   }
 
@@ -321,7 +335,7 @@
     const nameInput = textInput(column.name || '', '列名');
     nameInput.className = 'col-name-input';
     row.appendChild(wrap(nameInput, 'name'));
-    row.appendChild(wrap(typeInput(column.dataType || ''), 'type'));
+    row.appendChild(typeCell(column));
     row.appendChild(flagCell(checkbox(column.nullable !== false), 'nullable'));
     row.appendChild(defaultCell(column));
     row.appendChild(flagCell(checkbox(!!column.isPrimaryKey), 'primaryKey'));
@@ -352,29 +366,364 @@
   }
 
   /**
-   * 默认值单元格，顺带承载「额外子句」。
+   * 数据类型单元格。
    *
-   * MySQL 的 `ON UPDATE CURRENT_TIMESTAMP` 不属于类型 / 默认值 / 可空中的任何一项，
-   * 但改写这一列时又必须原样写回，因此用一个隐藏域带回，并在旁边显式展示出来——
-   * 用户至少要知道它存在，否则「我只是改了注释」会变成静默改表行为。
+   * 结构化模式 = 类型下拉 + 参数框（+ unsigned + 值列表）；解析不出来的类型走原始文本。
+   * 单元格自己记着 `data-touched`：只有被改过时才回传 typeSpec，没动过的列一律原样回传
+   * 读回来的类型文本（`int(10) unsigned zerofill` 这类写法因此不会在保存时被改写）。
+   */
+  function typeCell(column) {
+    const td = document.createElement('td');
+    td.className = 'col-type';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'cell-line';
+    wrapper.dataset.role = 'typeCell';
+    wrapper.dataset.mode = column.typeEditor && column.typeEditor.mode === 'raw' ? 'raw' : 'structured';
+    // 已有列：没被改过就原样回传读回来的类型文本；新列：本来就是「待填写」
+    wrapper.dataset.touched = column.originalName ? '0' : '1';
+    td.appendChild(wrapper);
+
+    const options = typeOptionList(column);
+    const base = (column.typeEditor && column.typeEditor.base) || '';
+    const current = options.find((option) => option.base === base) || options[0];
+
+    const baseSelect = document.createElement('select');
+    baseSelect.dataset.role = 'typeBase';
+    for (const option of options) {
+      const node = document.createElement('option');
+      node.value = option.base;
+      node.textContent = option.base || '（选择类型）';
+      node.dataset.argsKind = option.argsKind;
+      node.dataset.unsigned = option.unsigned ? '1' : '0';
+      baseSelect.appendChild(node);
+    }
+    baseSelect.value = current ? current.base : '';
+    wrapper.appendChild(baseSelect);
+
+    const argsInput = document.createElement('input');
+    argsInput.type = 'text';
+    argsInput.className = 'arg-input';
+    argsInput.dataset.role = 'typeArgs';
+    argsInput.value = (column.typeEditor && column.typeEditor.args) || '';
+    argsInput.autocomplete = 'off';
+    argsInput.spellcheck = false;
+    wrapper.appendChild(argsInput);
+
+    const unsignedWrap = document.createElement('label');
+    unsignedWrap.className = 'switch-label';
+    unsignedWrap.dataset.role = 'typeUnsignedWrap';
+    const unsigned = checkbox(!!(column.typeEditor && column.typeEditor.unsigned));
+    unsigned.dataset.role = 'typeUnsigned';
+    unsignedWrap.appendChild(unsigned);
+    unsignedWrap.appendChild(document.createTextNode('unsigned'));
+    wrapper.appendChild(unsignedWrap);
+
+    const valuesButton = ghostButton('值 (0)…', '编辑 enum / set 的取值', () => {
+      wrapper.dataset.enumOpen = wrapper.dataset.enumOpen === '1' ? '0' : '1';
+      refreshTypeCell(td);
+      clearResult();
+    });
+    valuesButton.dataset.role = 'typeValues';
+    wrapper.appendChild(valuesButton);
+
+    const rawToggle = ghostButton('原始', '改成直接填写类型文本', () => {
+      wrapper.dataset.mode = 'raw';
+      wrapper.dataset.touched = '1';
+      refreshTypeCell(td);
+      clearResult();
+    });
+    rawToggle.dataset.role = 'typeRawToggle';
+    wrapper.appendChild(rawToggle);
+
+    const rawInput = document.createElement('input');
+    rawInput.type = 'text';
+    rawInput.className = 'type-raw-input';
+    rawInput.dataset.role = 'typeRaw';
+    rawInput.value = (column.typeEditor && column.typeEditor.raw) || '';
+    rawInput.placeholder = '如 varchar(255)';
+    rawInput.autocomplete = 'off';
+    rawInput.spellcheck = false;
+    wrapper.appendChild(rawInput);
+
+    const enumCarrier = document.createElement('input');
+    enumCarrier.type = 'hidden';
+    enumCarrier.dataset.role = 'typeEnumValues';
+    enumCarrier.value = JSON.stringify((column.typeEditor && column.typeEditor.enumValues) || []);
+    wrapper.appendChild(enumCarrier);
+
+    const suffixCarrier = document.createElement('input');
+    suffixCarrier.type = 'hidden';
+    suffixCarrier.dataset.role = 'typeSuffix';
+    suffixCarrier.value = (column.typeEditor && column.typeEditor.suffix) || '';
+    wrapper.appendChild(suffixCarrier);
+
+    // 读回来的类型原文：类型控件没被改过时由扩展侧原样使用
+    const originalCarrier = document.createElement('input');
+    originalCarrier.type = 'hidden';
+    originalCarrier.dataset.role = 'typeOriginal';
+    originalCarrier.value = (column.typeEditor && column.typeEditor.raw) || column.dataType || '';
+    td.appendChild(originalCarrier);
+
+    const note = document.createElement('small');
+    note.className = 'hint';
+    note.dataset.role = 'typeNote';
+    note.dataset.text =
+      (column.typeEditor && column.typeEditor.note) || '这个类型无法用控件表达，已退回文本填写。';
+    note.hidden = true;
+    td.appendChild(note);
+
+    td.appendChild(enumEditor(td, column));
+    bindTypeEvents(td);
+    refreshTypeCell(td);
+    return td;
+  }
+
+  function enumEditor(td, column) {
+    const box = document.createElement('div');
+    box.className = 'enum-editor';
+    box.dataset.role = 'enumEditor';
+    box.hidden = true;
+
+    const rows = document.createElement('div');
+    rows.dataset.role = 'enumRows';
+    box.appendChild(rows);
+
+    const add = ghostButton('添加取值', '追加一个枚举值', () => {
+      appendEnumRow(rows, '', td);
+      syncEnumValues(td);
+      clearResult();
+    });
+    add.dataset.role = 'enumAdd';
+    box.appendChild(add);
+
+    for (const value of (column.typeEditor && column.typeEditor.enumValues) || []) {
+      appendEnumRow(rows, value, td);
+    }
+    if (!rows.childElementCount) {
+      appendEnumRow(rows, '', td);
+    }
+    syncEnumValues(td);
+    return box;
+  }
+
+  function appendEnumRow(rows, value, td) {
+    const line = document.createElement('div');
+    line.className = 'enum-row';
+    line.dataset.role = 'enumRow';
+
+    const input = textInput(value, '取值');
+    input.dataset.role = 'enumValue';
+    // 边打字边同步隐藏域：收集时只读隐藏域，漏一次就等于丢一个取值
+    input.addEventListener('input', () => syncEnumValues(td || rows.closest('td')));
+    line.appendChild(input);
+
+    const remove = ghostButton('✕', '删除该取值', () => {
+      line.remove();
+      syncEnumValues(td || rows.closest('td'));
+      clearResult();
+    });
+    remove.dataset.role = 'enumRemove';
+    line.appendChild(remove);
+
+    rows.appendChild(line);
+    return line;
+  }
+
+  /** 取值列表写回隐藏域（JSON：取值里可能带换行，用换行拼接会失真）。 */
+  function syncEnumValues(td) {
+    if (!td) {
+      return;
+    }
+    const values = [];
+    for (const line of td.querySelectorAll('[data-role="enumRow"]')) {
+      values.push(line.querySelector('[data-role="enumValue"]').value);
+    }
+    cellNode(td, 'typeEnumValues').value = JSON.stringify(values);
+    cellNode(td, 'typeValues').textContent = `值 (${values.length})…`;
+    markTouched(td);
+  }
+
+  function bindTypeEvents(td) {
+    const wrapper = cellNode(td, 'typeCell');
+    const baseSelect = cellNode(td, 'typeBase');
+    const argsInput = cellNode(td, 'typeArgs');
+    const rawInput = cellNode(td, 'typeRaw');
+    const unsigned = cellNode(td, 'typeUnsigned');
+
+    baseSelect.addEventListener('change', () => {
+      // 换了基础类型，原来那个类型特有的尾部修饰（with time zone）与取值列表都不再适用
+      cellNode(td, 'typeSuffix').value = '';
+      const option = currentTypeOption(td);
+      if (option && option.argsKind !== 'values') {
+        cellNode(td, 'typeEnumValues').value = '[]';
+      }
+      markTouched(td);
+      refreshTypeCell(td);
+      clearResult();
+    });
+    for (const control of [argsInput, rawInput, unsigned]) {
+      control.addEventListener('input', () => {
+        wrapper.dataset.touched = '1';
+        clearResult();
+      });
+      control.addEventListener('change', () => {
+        wrapper.dataset.touched = '1';
+        clearResult();
+      });
+    }
+  }
+
+  /** 按当前模式与类型刷新参数框、unsigned、取值入口的可见性。 */
+  function refreshTypeCell(td) {
+    const wrapper = cellNode(td, 'typeCell');
+    const raw = wrapper.dataset.mode === 'raw';
+    const option = currentTypeOption(td);
+    const argsKind = option ? option.argsKind : 'none';
+
+    cellNode(td, 'typeBase').hidden = raw;
+    const argsInput = cellNode(td, 'typeArgs');
+    argsInput.hidden = raw || !ARG_PLACEHOLDER[argsKind];
+    argsInput.placeholder = ARG_PLACEHOLDER[argsKind] || '';
+    cellNode(td, 'typeUnsignedWrap').hidden = raw || !supportsUnsigned(td, option);
+    cellNode(td, 'typeValues').hidden = raw || argsKind !== 'values';
+    cellNode(td, 'typeRawToggle').hidden = raw;
+    cellNode(td, 'typeRaw').hidden = !raw;
+    cellNode(td, 'enumEditor').hidden = raw || argsKind !== 'values' || wrapper.dataset.enumOpen !== '1';
+
+    const note = cellNode(td, 'typeNote');
+    note.hidden = !raw;
+    if (raw) {
+      note.textContent = note.dataset.text || '';
+    }
+  }
+
+  /** 当前下拉选中的选项。 */
+  function currentTypeOption(td) {
+    const select = cellNode(td, 'typeBase');
+    const selected = select.options[select.selectedIndex];
+    if (!selected) {
+      return undefined;
+    }
+    return {
+      base: selected.value,
+      argsKind: selected.dataset.argsKind || 'none',
+      unsigned: selected.dataset.unsigned === '1',
+    };
+  }
+
+  /** unsigned 只在数值类型上有意义；当前列已经是 unsigned 时也要保留勾选框。 */
+  function supportsUnsigned(td, option) {
+    return !!(option && option.unsigned) || !!cellNode(td, 'typeUnsigned').checked;
+  }
+
+  /** 类型下拉的候选：模型给的选项 + 当前列自己的基础类型（不在候选里时补进去）。 */
+  function typeOptionList(column) {
+    const options = (state.model.typeOptions || []).map((option) => ({ ...option }));
+    const editor = column.typeEditor || {};
+    const base = editor.base;
+    if (base && !options.some((option) => option.base === base)) {
+      options.unshift({ base, argsKind: editor.argsKind || 'none', unsigned: !!editor.unsigned });
+    }
+    if (!base) {
+      options.unshift({ base: '', argsKind: 'none', unsigned: false });
+    }
+    return options;
+  }
+
+  function cellNode(td, role) {
+    return td.querySelector(`[data-role="${role}"]`);
+  }
+
+  function markTouched(td) {
+    const wrapper = cellNode(td, 'typeCell');
+    if (wrapper) {
+      wrapper.dataset.touched = '1';
+    }
+  }
+
+  /**
+   * 默认值单元格。
+   *
+   * 三选一（无 / 常量 / 表达式）+ 值输入；MySQL 的时间列额外给「自动更新为当前时间」开关。
+   * 与类型单元格同一套规矩：没动过就原样回传读回来的默认值，`extraClauses` 也原样带走。
    */
   function defaultCell(column) {
-    const value = column.defaultValue === null || column.defaultValue === undefined ? '' : String(column.defaultValue);
-    const td = wrap(textInput(value, '默认值'), 'default');
+    const td = document.createElement('td');
+    td.className = 'col-default';
 
-    const extra = typeof column.extraClauses === 'string' ? column.extraClauses.trim() : '';
+    const editor = column.defaultEditor || { kind: 'none', value: '' };
+    const wrapper = document.createElement('div');
+    wrapper.className = 'cell-line';
+    wrapper.dataset.role = 'defaultCell';
+    wrapper.dataset.touched = '0';
+    td.appendChild(wrapper);
+
+    const kind = document.createElement('select');
+    kind.dataset.role = 'defaultKind';
+    for (const [value, text] of [['none', '无默认值'], ['constant', '常量'], ['expression', '表达式']]) {
+      const node = document.createElement('option');
+      node.value = value;
+      node.textContent = text;
+      kind.appendChild(node);
+    }
+    kind.value = editor.kind || 'none';
+    wrapper.appendChild(kind);
+
+    const value = textInput(editor.kind === 'none' ? '' : editor.value || '', DEFAULT_HINT[editor.kind || 'none']);
+    value.dataset.role = 'defaultValue';
+    wrapper.appendChild(value);
+
+    // 读回来的默认值原文：未触碰时原样回传；`data-empty` 区分「没有默认值」与「空串」
+    const original = document.createElement('input');
+    original.type = 'hidden';
+    original.dataset.role = 'defaultOriginal';
+    original.dataset.empty = column.defaultValue === null || column.defaultValue === undefined ? '1' : '0';
+    original.value = column.defaultValue === null || column.defaultValue === undefined ? '' : String(column.defaultValue);
+    td.appendChild(original);
+
+    const onUpdate = column.onUpdate || { supported: false, enabled: false };
+    if (onUpdate.supported) {
+      const label = document.createElement('label');
+      label.className = 'switch-label';
+      label.dataset.role = 'onUpdateWrap';
+      // 记下初始状态：只有翻转时才回传开关，没动过就原样保留 extraClauses
+      label.dataset.enabled = onUpdate.enabled ? '1' : '0';
+      const box = checkbox(!!onUpdate.enabled);
+      box.dataset.role = 'onUpdate';
+      box.addEventListener('click', () => clearResult());
+      label.appendChild(box);
+      label.appendChild(document.createTextNode('自动更新为当前时间'));
+      td.appendChild(label);
+    }
+
+    // 无法用开关表达的额外子句（MySQL 的 ON UPDATE 之外的形态）原样带回并标注
+    const extra = column.extraClauses || '';
     const carrier = document.createElement('input');
     carrier.type = 'hidden';
     carrier.dataset.role = 'extra';
     carrier.value = extra;
     td.appendChild(carrier);
-    if (extra) {
+    if (extra && !(column.onUpdate && column.onUpdate.supported)) {
       const badge = document.createElement('small');
       badge.className = 'hint extra-clause';
       badge.textContent = extra;
       badge.title = '该子句会原样保留，暂不支持在界面上修改或移除';
       td.appendChild(badge);
     }
+
+    kind.addEventListener('change', () => {
+      wrapper.dataset.touched = '1';
+      value.placeholder = DEFAULT_HINT[kind.value] || '';
+      if (kind.value === 'none') {
+        value.value = '';
+      }
+      clearResult();
+    });
+    value.addEventListener('input', () => {
+      wrapper.dataset.touched = '1';
+      clearResult();
+    });
     return td;
   }
 
@@ -442,6 +791,10 @@
     return button;
   }
 
+  function ghostButton(text, title, handler) {
+    return iconButton(text, title, handler);
+  }
+
   function textInput(value, placeholder) {
     const input = document.createElement('input');
     input.type = 'text';
@@ -450,12 +803,6 @@
     input.autocomplete = 'off';
     input.spellcheck = false;
     input.addEventListener('input', clearResult);
-    return input;
-  }
-
-  function typeInput(value) {
-    const input = textInput(value, '如 varchar(255)');
-    input.setAttribute('list', 'dataTypes');
     return input;
   }
 
@@ -491,22 +838,75 @@
 
     const columns = [];
     for (const row of el.columns.querySelectorAll('tr')) {
-      const autoIncrement = readFlag(row, 'autoIncrement');
-      columns.push({
+      const typeCellEl = row.querySelector('[data-role="typeCell"]');
+      const mode = typeCellEl.dataset.mode;
+      const touchedType = typeCellEl.dataset.touched === '1';
+      let typeSpec;
+      if (mode === 'raw') {
+        typeSpec = { mode: 'raw', text: readValue(row, 'typeRaw') };
+      } else if (touchedType) {
+        typeSpec = {
+          mode: 'structured',
+          base: readValue(row, 'typeBase'),
+          args: readValue(row, 'typeArgs'),
+          unsigned: readFlag(row, 'typeUnsigned'),
+          enumValues: parseEnumCarrier(readValue(row, 'typeEnumValues')),
+          suffix: readValue(row, 'typeSuffix'),
+        };
+      }
+
+      const defaultCellEl = row.querySelector('[data-role="defaultCell"]');
+      const touchedDefault = defaultCellEl.dataset.touched === '1';
+      const defaultSpec = touchedDefault
+        ? { kind: readValue(row, 'defaultKind') || 'none', value: readValue(row, 'defaultValue') }
+        : undefined;
+
+      const onUpdateWrap = row.querySelector('[data-role="onUpdateWrap"]');
+      let onUpdateTimestamp;
+      if (onUpdateWrap) {
+        const next = readFlag(row, 'onUpdate') ? '1' : '0';
+        if (next !== onUpdateWrap.dataset.enabled) {
+          onUpdateTimestamp = next === '1';
+        }
+      }
+
+      const original = row.querySelector('[data-role="defaultOriginal"]');
+      const column = {
         // 新增列没有 originalName，扩展侧据此判定「这是新列」
         originalName: row.dataset.originalName || undefined,
         name: readValue(row, 'name').trim(),
-        dataType: readValue(row, 'type').trim(),
+        // 读回来的类型文本：只有类型控件没被改过时才会被用到
+        dataType: readValue(row, 'typeOriginal'),
         nullable: readFlag(row, 'nullable'),
-        defaultValue: readValue(row, 'default').trim() || null,
+        // 「没有默认值」与「默认值为空串」不能合并成同一个值
+        defaultValue: original.dataset.empty === '1' ? null : original.value,
         isPrimaryKey: readFlag(row, 'primaryKey'),
-        autoIncrement,
+        autoIncrement: readFlag(row, 'autoIncrement'),
         comment: readValue(row, 'comment').trim(),
-        // 驱动读回来的额外子句（MySQL 的 ON UPDATE）原样带回：丢了就是静默改表行为
+        // 驱动读回来的额外子句原样带回：丢了（且开关不支持它时）就是静默改表行为
         extraClauses: readValue(row, 'extra') || undefined,
-      });
+      };
+      if (typeSpec) {
+        column.typeSpec = typeSpec;
+      }
+      if (defaultSpec) {
+        column.defaultSpec = defaultSpec;
+      }
+      if (onUpdateTimestamp !== undefined) {
+        column.onUpdateTimestamp = onUpdateTimestamp;
+      }
+      columns.push(column);
     }
     return { properties, columns };
+  }
+
+  function parseEnumCarrier(text) {
+    try {
+      const values = JSON.parse(text || '[]');
+      return Array.isArray(values) ? values : [];
+    } catch (err) {
+      return [];
+    }
   }
 
   function readValue(row, role) {
@@ -541,7 +941,13 @@
         return `列名重复：${column.name}`;
       }
       seen.add(key);
-      if (!column.dataType) {
+      // 结构化模式下类型可能还没从下拉里选（新列），这里先拦一道
+      const typed = column.typeSpec
+        ? column.typeSpec.mode === 'raw'
+          ? !!column.typeSpec.text.trim()
+          : !!column.typeSpec.base
+        : !!column.dataType.trim();
+      if (!typed) {
         return `列 ${column.name} 缺少数据类型`;
       }
     }

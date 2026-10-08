@@ -1750,6 +1750,226 @@ function fakeDriver(options) {
     assert.strictEqual(mysqlDefinition.capabilities.editDatabaseProperties, true);
   });
 
+  console.log('\n=== 20. 列结构化编辑：类型 / 默认值 / ON UPDATE ===');
+  const specs = require(path.join(outDir, 'core', 'columnSpecs.js'));
+  const specCol = (over) =>
+    Object.assign({ name: 'c', dataType: 'int', nullable: true, defaultValue: null, comment: '' }, over || {});
+
+  check('类型解析：认识形态结构化，不认识的一律退回 raw', () => {
+    const structured = specs.describeColumnTypeEditor('varchar(64)');
+    assert.strictEqual(structured.mode, 'structured');
+    assert.strictEqual(structured.base, 'varchar');
+    assert.strictEqual(structured.args, '64');
+    assert.strictEqual(structured.argsKind, 'length');
+
+    // `int(10) unsigned zerofill`：modifier 与后缀都要剥干净，且能逐字节合成回去
+    const full = specs.describeColumnTypeEditor('int(10) unsigned zerofill');
+    assert.strictEqual(full.mode, 'structured');
+    assert.strictEqual(full.base, 'int');
+    assert.strictEqual(full.args, '10');
+    assert.strictEqual(full.unsigned, true);
+    assert.strictEqual(specs.formatColumnType({ mode: 'structured', base: 'int', args: '10', unsigned: true, suffix: 'zerofill' }), 'int(10) unsigned zerofill');
+
+    // 参数形态按类型分派：长度 / 精度 / 秒 / 取值列表
+    assert.strictEqual(specs.describeColumnTypeEditor('decimal(10,2)').argsKind, 'precision');
+    assert.strictEqual(specs.describeColumnTypeEditor('timestamp(3)').argsKind, 'seconds');
+    assert.strictEqual(specs.describeColumnTypeEditor("enum('a','b')").argsKind, 'values');
+    assert.deepStrictEqual(specs.describeColumnTypeEditor("enum('a','b')").enumValues, ['a', 'b']);
+
+    // 时间区后缀不是修饰，原样带回
+    const tz = specs.describeColumnTypeEditor('timestamp with time zone');
+    assert.strictEqual(tz.mode, 'structured');
+    assert.strictEqual(tz.suffix, 'with time zone');
+
+    // 看不回的形态必须退回原始文本，不许猜着改
+    for (const raw of ['geometry(POINT,4326)', 'int(10) unsigned 没见过的东西', 'varchar(64,2)', '']) {
+      const editor = specs.describeColumnTypeEditor(raw);
+      assert.strictEqual(editor.mode, 'raw', `${raw || '(空)'} 应退回 raw`);
+      assert.strictEqual(editor.raw, raw.trim());
+    }
+  });
+
+  check('类型下拉选项：去参数去重，同名以带 unsigned 的为准', () => {
+    const options = specs.baseTypeOptions(['int(11)', 'int(10) unsigned', 'varchar(20)', 'varchar(30)', 'text']);
+    const byBase = new Map(options.map((o) => [o.base, o]));
+    assert.ok(!byBase.has('int(11)'), '参数应被剥掉');
+    assert.strictEqual(byBase.get('int').unsigned, true);
+    assert.strictEqual(byBase.get('varchar').unsigned, false);
+    assert.strictEqual(byBase.get('text').argsKind, 'none');
+  });
+
+  check('类型校验：必填长度拦下，缺参数不误伤合法的裸类型', () => {
+    assert.strictEqual(specs.validateTypeSpec({ mode: 'structured', base: 'varchar' }), 'varchar 需要填写长度');
+    assert.strictEqual(specs.validateTypeSpec({ mode: 'structured', base: 'varchar', args: '64' }), undefined);
+    // int / decimal 裸写是合法的，不该拦
+    assert.strictEqual(specs.validateTypeSpec({ mode: 'structured', base: 'int' }), undefined);
+    assert.strictEqual(specs.validateTypeSpec({ mode: 'structured', base: 'decimal' }), undefined);
+    assert.strictEqual(specs.validateTypeSpec({ mode: 'structured', base: 'timestamp', args: '9' }), 'timestamp 的秒精度需要是 0–6 的整数');
+    assert.ok(specs.validateTypeSpec({ mode: 'structured', base: 'enum' }), 'enum 至少要一个取值');
+    // raw 模式原样下发，不做校验
+    assert.strictEqual(specs.validateTypeSpec({ mode: 'raw', text: 'geometry(POINT,4326)' }), undefined);
+  });
+
+  check('默认值语义：空串常量与无默认值不混淆，可疑形态归表达式', () => {
+    assert.strictEqual(specs.classifyDefaultKind(specCol({ defaultValue: null })), 'none');
+    assert.strictEqual(specs.classifyDefaultKind(specCol({ defaultValue: '' })), 'constant');
+    assert.strictEqual(specs.classifyDefaultKind(specCol({ defaultValue: 'abc' })), 'constant');
+    assert.strictEqual(specs.classifyDefaultKind(specCol({ defaultValue: 'CURRENT_TIMESTAMP' })), 'expression');
+    assert.strictEqual(specs.classifyDefaultKind(specCol({ defaultValue: "_utf8mb4\\'x\\'" })), 'expression');
+    assert.strictEqual(specs.classifyDefaultKind(specCol({ defaultValue: "nextval('s'::regclass)" })), 'expression');
+    // 界面显式声明的语义优先于推断
+    assert.strictEqual(
+      specs.describeColumnDefaultEditor(specCol({ defaultValue: 'now()', defaultKind: 'constant' })).kind,
+      'constant',
+    );
+  });
+
+  check('默认值签名：语义变了也算变更，没动过的列仍然判等', () => {
+    const origin = specCol({ defaultValue: 'abc' });
+    const untouched = specCol({ defaultValue: 'abc' });
+    assert.strictEqual(specs.defaultSignature(origin), specs.defaultSignature(untouched), '读回的列没有 defaultKind，未触碰时不该判成变更');
+
+    const toExpression = specCol({ defaultValue: 'abc', defaultKind: 'expression' });
+    assert.notStrictEqual(specs.defaultSignature(origin), specs.defaultSignature(toExpression), '值相同但语义不同即变更');
+
+    // '' 与 null 必须两回事
+    assert.notStrictEqual(
+      specs.defaultSignature(specCol({ defaultValue: '' })),
+      specs.defaultSignature(specCol({ defaultValue: null })),
+    );
+  });
+
+  check('ON UPDATE：开关只表达 CURRENT_TIMESTAMP，看不懂的原样保留', () => {
+    assert.deepStrictEqual(specs.describeOnUpdate('', true, 'datetime'), { supported: true, enabled: false });
+    assert.deepStrictEqual(specs.describeOnUpdate('ON UPDATE CURRENT_TIMESTAMP', true, 'datetime'), {
+      supported: true,
+      enabled: true,
+      precision: undefined,
+    });
+    assert.strictEqual(specs.describeOnUpdate('ON UPDATE CURRENT_TIMESTAMP(3)', true, 'timestamp(3)').precision, 3);
+    // 驱动不支持（PG）时不给开关
+    assert.deepStrictEqual(specs.describeOnUpdate('ON UPDATE CURRENT_TIMESTAMP', false, 'timestamp'), {
+      supported: false,
+      enabled: false,
+    });
+    // 看不懂的额外子句不能因为「不是 CURRENT_TIMESTAMP」就丢掉
+    const odd = specs.describeOnUpdate('ON UPDATE SOMETHING_ELSE', true, 'datetime');
+    assert.strictEqual(odd.supported, false);
+    assert.strictEqual(specs.composeOnUpdateClause('ON UPDATE SOMETHING_ELSE', true, 'datetime'), 'ON UPDATE SOMETHING_ELSE');
+
+    // 精度优先沿用原子句，否则 timestamp(3) 上的 ON UPDATE 会掉到秒精度
+    assert.strictEqual(
+      specs.composeOnUpdateClause('ON UPDATE CURRENT_TIMESTAMP(3)', true, 'timestamp(3)'),
+      'ON UPDATE CURRENT_TIMESTAMP(3)',
+    );
+    assert.strictEqual(specs.composeOnUpdateClause(undefined, true, 'timestamp(3)'), 'ON UPDATE CURRENT_TIMESTAMP(3)');
+    assert.strictEqual(specs.composeOnUpdateClause(undefined, true, 'datetime'), 'ON UPDATE CURRENT_TIMESTAMP');
+    // 关掉即整段移除
+    assert.strictEqual(specs.composeOnUpdateClause('ON UPDATE CURRENT_TIMESTAMP', false, 'datetime'), '');
+  });
+
+  check('resolveEditorColumns：未触碰就沿用原文，改过才合成', () => {
+    const origin = Object.assign(specCol({ dataType: 'int(10) unsigned zerofill', defaultValue: 'abc' }), {
+      originalName: 'c',
+    });
+    const untouched = specs.resolveEditorColumns([origin])[0];
+    assert.strictEqual(untouched.dataType, 'int(10) unsigned zerofill', '没碰类型就不能被改写');
+    assert.strictEqual(untouched.defaultValue, 'abc');
+
+    const touched = specs.resolveEditorColumns([
+      Object.assign({}, origin, {
+        typeSpec: { mode: 'structured', base: 'varchar', args: '128' },
+        defaultSpec: { kind: 'expression', value: 'now()' },
+        onUpdateTimestamp: true,
+      }),
+    ])[0];
+    assert.strictEqual(touched.dataType, 'varchar(128)');
+    assert.strictEqual(touched.defaultValue, 'now()');
+    assert.strictEqual(touched.defaultKind, 'expression');
+    assert.strictEqual(touched.extraClauses, 'ON UPDATE CURRENT_TIMESTAMP');
+    // 只有界面认识的字段不许混进发给驱动的请求
+    assert.strictEqual(touched.typeSpec, undefined);
+    assert.strictEqual(touched.defaultSpec, undefined);
+    assert.strictEqual(touched.onUpdateTimestamp, undefined);
+
+    // 校验不过要报错，且带上列名
+    assert.throws(
+      () => specs.resolveEditorColumns([Object.assign({}, origin, { name: 'nickname', typeSpec: { mode: 'structured', base: 'varchar' } })]),
+      /nickname：varchar 需要填写长度/,
+    );
+
+    // 选「无默认值」要把值清成 null，空串常量则保留空串
+    const cleared = specs.resolveEditorColumns([
+      Object.assign({}, origin, { defaultSpec: { kind: 'none' } }),
+    ])[0];
+    assert.strictEqual(cleared.defaultValue, null);
+    const emptyString = specs.resolveEditorColumns([
+      Object.assign({}, origin, { defaultSpec: { kind: 'constant', value: '' } }),
+    ])[0];
+    assert.strictEqual(emptyString.defaultValue, '');
+  });
+
+  check('默认值语义贯通到 DDL：常量与表达式渲染不同', () => {
+    const base = { name: 'c', dataType: 'varchar(32)', nullable: true, defaultValue: 'abc', comment: '' };
+    // MySQL：常量语义下进字符串字面量；同一段文本当表达式则原样下发（括号是既有行为）
+    assert.ok(
+      mysqlStructure.renderMysqlColumn(Object.assign({}, base, { defaultKind: 'constant' })).includes("DEFAULT 'abc'"),
+      '常量语义应加引号',
+    );
+    assert.ok(
+      !mysqlStructure.renderMysqlColumn(Object.assign({}, base, { defaultKind: 'expression' })).includes("'abc'"),
+      '表达式语义不应擅自加引号',
+    );
+    // 长得像函数的字面量在常量语义下绝不能被当函数执行
+    const fnLike = Object.assign({}, base, { defaultValue: 'now()' });
+    assert.ok(
+      mysqlStructure.renderMysqlColumn(Object.assign({}, fnLike, { defaultKind: 'constant' })).includes("DEFAULT 'now()'"),
+      '常量语义下 now() 必须是字符串字面量',
+    );
+    assert.ok(
+      mysqlStructure.renderMysqlColumn(Object.assign({}, fnLike, { defaultKind: 'expression' })).includes('DEFAULT (now())'),
+      '表达式语义下 now() 才是函数调用',
+    );
+    // 数值列上的常量数字裸写，字符串列上的同一段文本必须加引号
+    assert.ok(
+      mysqlStructure.renderMysqlColumn(
+        Object.assign({}, base, { dataType: 'int', defaultValue: '42', defaultKind: 'constant' }),
+      ).includes('DEFAULT 42'),
+    );
+    // 常量的空串与「无默认值」不可混淆
+    assert.ok(
+      mysqlStructure.renderMysqlColumn(Object.assign({}, base, { defaultValue: '', defaultKind: 'constant' })).includes("DEFAULT ''"),
+    );
+    assert.ok(!mysqlStructure.renderMysqlColumn(Object.assign({}, base, { defaultValue: null })).includes('DEFAULT'));
+
+    // PG：pg_get_expr 读回的表达式原样写回，常量才进字符串字面量
+    const pgCol = (over) => Object.assign({ name: 'c', dataType: 'text', nullable: true, comment: '' }, over || {});
+    assert.ok(pgStructure.renderPgColumn(pgCol({ defaultValue: "'abc'::text", defaultKind: 'expression' })).includes("DEFAULT 'abc'::text"));
+    assert.ok(pgStructure.renderPgColumn(pgCol({ defaultValue: 'abc', defaultKind: 'constant' })).includes("DEFAULT 'abc'"));
+    assert.ok(pgStructure.renderPgColumn(pgCol({ defaultValue: '', defaultKind: 'constant' })).includes("DEFAULT ''"));
+    assert.ok(!pgStructure.renderPgColumn(pgCol({ defaultValue: null })).includes('DEFAULT'));
+  });
+
+  check('列比较：值相同但语义不同必须判成变更', () => {
+    const a = { name: 'c', dataType: 'varchar(32)', nullable: true, defaultValue: 'abc', comment: '' };
+    assert.strictEqual(
+      mysqlStructure.sameMysqlColumn(a, Object.assign({}, a, { defaultKind: 'constant' })),
+      true,
+      '没声明 defaultKind 的一侧按推断归类，两边同为常量应判等',
+    );
+    assert.strictEqual(
+      mysqlStructure.sameMysqlColumn(
+        Object.assign({}, a, { defaultKind: 'constant' }),
+        Object.assign({}, a, { defaultKind: 'expression' }),
+      ),
+      false,
+    );
+    assert.strictEqual(
+      pgStructure.samePgColumn(Object.assign({}, a, { defaultKind: 'constant' }), Object.assign({}, a, { defaultKind: 'expression' })),
+      false,
+    );
+  });
+
   console.log(`\n=========================================`);
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项`);
   if (failures.length) {

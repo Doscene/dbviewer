@@ -14,13 +14,13 @@ import {
   diffPrimaryKey,
   diffProperties,
   diffTableColumns,
-  normalizeDefaultText,
   normalizeTypeText,
   propertyChangeValue,
   summarizeColumnsDiff,
   validateColumnDefinitions,
   validateObjectName,
 } from '../core/objectEditor';
+import { defaultSignature } from '../core/columnSpecs';
 import { pgQualified, quotePgIdent, quotePgString } from '../core/sqlText';
 import {
   DatabaseChangeRequest,
@@ -164,8 +164,8 @@ export async function buildPgTablePlan(
     if (!!origin.nullable !== !!column.nullable) {
       statements.push(`ALTER TABLE ${qualified} ALTER COLUMN ${name} ${column.nullable ? 'DROP' : 'SET'} NOT NULL;`);
     }
-    if (normalizeDefaultText(origin.defaultValue) !== normalizeDefaultText(column.defaultValue)) {
-      const text = String(column.defaultValue ?? '').trim();
+    if (defaultSignature(origin) !== defaultSignature(column)) {
+      const text = pgDefaultText(column);
       statements.push(
         text
           ? `ALTER TABLE ${qualified} ALTER COLUMN ${name} SET DEFAULT ${text};`
@@ -278,7 +278,7 @@ export function buildPgDatabasePlan(
 /** 新列的完整定义；PG 的位置由追加决定，没有 AFTER 语义。 */
 export function renderPgColumn(column: TableColumnDefinition): string {
   const parts = [quotePgIdent(column.name.trim()), column.dataType.trim()];
-  const defaultValue = String(column.defaultValue ?? '').trim();
+  const defaultValue = pgDefaultText(column);
   if (defaultValue) {
     parts.push(`DEFAULT ${defaultValue}`);
   }
@@ -286,6 +286,21 @@ export function renderPgColumn(column: TableColumnDefinition): string {
     parts.push('NOT NULL');
   }
   return parts.join(' ');
+}
+
+/**
+ * 默认值文本。
+ *
+ * `pg_get_expr` 读回来的是完整表达式（`'abc'::character varying` / `nextval(…)`），
+ * 原样写回最稳；界面声明为「常量」时才走字符串字面量 —— PG 会把未定型字面量按列类型
+ * 隐式转换，因此 `''` 与「没有默认值」也能区分开（这正是裸文本做不到的）。
+ */
+function pgDefaultText(column: TableColumnDefinition): string {
+  const raw = column.defaultValue === null || column.defaultValue === undefined ? '' : String(column.defaultValue);
+  if (column.defaultKind === 'constant') {
+    return quotePgString(raw);
+  }
+  return raw.trim();
 }
 
 /** 列注释：PG 的注释是独立对象，清空要写 IS NULL，写 IS '' 会留下一个空注释。 */
@@ -317,7 +332,8 @@ export function samePgColumn(a: TableColumnDefinition, b: TableColumnDefinition)
   return (
     normalizePgType(a.dataType) === normalizePgType(b.dataType) &&
     !!a.nullable === !!b.nullable &&
-    normalizeDefaultText(a.defaultValue) === normalizeDefaultText(b.defaultValue) &&
+    // 默认值连语义一起比：常量与表达式即使文本相同，渲染出来的语句也不同
+    defaultSignature(a) === defaultSignature(b) &&
     (a.comment ?? '').trim() === (b.comment ?? '').trim()
   );
 }

@@ -16,6 +16,10 @@
 
 ### 变更
 
+- **列类型改用结构化控件**：从「一个自由文本框 + datalist 提示」改为「基础类型下拉 + 参数框 + `UNSIGNED` 开关」（`enum` / `set` 另有取值列表编辑器）。参数形态按类型区分 —— 长度 / 精度 / 小数秒 / 取值列表。界面没暴露的写法（`zerofill`、`with time zone`）作为尾部修饰原样带回；`int(10) unsigned zerofill` 这类解析不回来的写法自动退回原始文本框，绝不猜着改。
+- **默认值区分「常量」与「表达式」**：新增 `DefaultKind`，面板让用户显式声明语义，避免 `now()` 既是字面量又是函数、`'abc'::character varying` 只能原样写回的歧义。常量语义下数值列的数字裸写、其余一律进字符串字面量（`''` 与「没有默认值」不再混淆）；PG 利用未定型字面量的隐式转换，`''` 也能正确区分开。`sameMysqlColumn` / `samePgColumn` 改为比对「值 + 语义」，只把常量改成表达式也会被认成变更。
+- **`ON UPDATE CURRENT_TIMESTAMP` 改为显式开关**：新增能力位 `TableStructure.allowAutoUpdate`（MySQL `true` / PG `false`，视图层不按驱动名分支），界面可一键开关；该子句无法用开关表达时必须原样透传，不允许丢弃。
+- 「将要执行的语句」折叠为默认收起的 `<details>`，列多时不再把预览挤到屏幕外。
 - 结构变更语句统一经 `driver.execute()` 下发，只读连接照样被驱动层拦下；MySQL 逐条执行并报告「第 N 条失败、前 M 条已生效」（DDL 无法回滚），PostgreSQL 整批包在事务里、失败自动 `ROLLBACK`。
 - Sidecar 模式同步支持：代理层与 sidecar host 增加 `describeTable` / `planTableChange` / `applyTableChange` / `describeDatabaseProperties` / `planDatabaseChange` / `applyDatabaseChange` 六个 RPC。
 - `package.json` 注册 `dbviewer.editTableStructure` / `dbviewer.editDatabaseProperties` 两条命令与表 / 库 / schema 节点的右键菜单（`3_modify` 分组），命令面板中隐藏。
@@ -27,10 +31,11 @@
 - **`ALTER DATABASE` 不接受逗号分隔的多个选项**：同时改字符集与排序规则时生成的 `CHARACTER SET = a, COLLATE = b` 会被服务端判为语法错误，改为空格相连（`CHARACTER SET = a COLLATE = b`）。
 - **TEXT / BLOB / JSON 列的默认值必须是表达式形式**：裸写 `DEFAULT 'x'` 会被服务端拒绝（`BLOB, TEXT, GEOMETRY or JSON column can't have a default value`）。现在这几类列一律生成 `DEFAULT ('x')`；同时读回的值会先反转义再写回 —— `information_schema` 给出的表达式默认值形如 `_utf8mb4\'hello\'`（带字符集引导符且引号被转义），原样写回同样是语法错误。数字类型上手打的裸表达式（如 `3 * 7`）也补上括号。
 - **改写列定义时 `ON UPDATE CURRENT_TIMESTAMP` 被静默抹掉**：这类子句只存在于 `information_schema` 的 `EXTRA` 里，不体现在类型 / 默认值 / 可空任何一项上，改个注释就会把「时间戳自动更新」一起弄丢，而服务端不会报任何错。现在列定义带 `extraClauses` 原样往返（界面会把它标出来），缺失时按 `originalName` 从读回的现状继承。
+- **`int(10) unsigned zerofill` 认不出来**：`zerofill` 被从类型尾部剥掉却没记进要原样带回的后缀，「解析 → 合成」自检对不上，整条退回原始文本框。保真没丢，但白扔了本可结构化的形态；现在 `zerofill` 记为 suffix，与 `with time zone` 同路径往返。
 
 ### 测试
 
-- 冒烟测试从 89 项扩展到 **126 项**：新增差异计算与校验（类型 / 默认值归一、改名不误判为删旧增新、列序判定、主键增删、属性差异、重名与超长名校验），以及两个方言的 DDL 生成（新增列的 `FIRST` / `AFTER`、默认值按类型补引号与表达式括号、TEXT / JSON 的表达式默认值形态与反转义、`ON UPDATE` 子句往返、`DROP PRIMARY KEY` 必须排在删列之前、PG 的 `USING` 转换与 `DROP DEFAULT` / `IS NULL`、类型别名等价不产生多余语句、库属性 `ALTER DATABASE` 不带 `DEFAULT` 也不带逗号、只改字符集时补默认排序规则）。
+- 冒烟测试从 89 项扩展到 **135 项**：新增差异计算与校验（类型 / 默认值归一、改名不误判为删旧增新、列序判定、主键增删、属性差异、重名与超长名校验），两个方言的 DDL 生成（新增列的 `FIRST` / `AFTER`、默认值按类型补引号与表达式括号、TEXT / JSON 的表达式默认值形态与反转义、`ON UPDATE` 子句往返、`DROP PRIMARY KEY` 必须排在删列之前、PG 的 `USING` 转换与 `DROP DEFAULT` / `IS NULL`、类型别名等价不产生多余语句、库属性 `ALTER DATABASE` 不带 `DEFAULT` 也不带逗号、只改字符集时补默认排序规则），以及 `core/columnSpecs.ts` 的 9 项（类型解析与「解析不回来就退回 raw」的自检、`int(10) unsigned zerofill` 逐字节往返、下拉选项去重、必填长度不误伤裸类型、默认值三态分类与签名比较、`ON UPDATE` 开关的精度继承与看不懂子句的原样保留、面板目标还原、语义贯通到两个方言的 DDL、列比较认语义变化）。
 - 激活测试从 72 项扩展到 **88 项**：右键菜单声明、无节点 / 未知连接不开面板、面板模型与引导数据、只读连接提示、`ready` / `preview` / `apply` 往返、用户取消算提示而非错误、生成失败与重读失败的错误回传、库属性模式不渲染列表格、单实例替换与回收。
 - 新增 `scripts/live-mysql-test.js`（`npm run test:live`，**不在 `npm test` 门禁内**）：对着真实 MySQL 建库建表，跑完「读结构 → 生成计划 → 执行 → 复读校验 → 失败路径 → 库属性」共 24 项断言，覆盖复合主键、列改名、增删列、调序、换引擎、`ON UPDATE` 与 `unsigned zerofill` / `enum` / `set` / `bit` / `binary` / `timestamp(3)` 的保真，结束时 `DROP DATABASE` 自清理。凭据只走环境变量。
 

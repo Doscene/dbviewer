@@ -384,6 +384,8 @@ export class PostgresDriver implements IDatabaseDriver {
       allowReorder: false,
       // 既有列不能就地转自增（要新建序列 + OWNED BY + SET DEFAULT），界面上直接不给这个开关
       allowAutoIncrement: false,
+      // PG 没有 ON UPDATE CURRENT_TIMESTAMP 这种列子句（时间戳自动更新要靠触发器）
+      allowAutoUpdate: false,
       ddl: await this.showCreateTable({ database: target.database, schema, table: target.table }).catch(() => undefined),
     };
   }

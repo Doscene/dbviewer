@@ -11,6 +11,13 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 
 import { ConnectionManager, ConnectResult } from '../core/connectionManager';
+import {
+  baseTypeOptions,
+  describeColumnDefaultEditor,
+  describeColumnTypeEditor,
+  describeOnUpdate,
+  resolveEditorColumns,
+} from '../core/columnSpecs';
 import { ConnectionInput, ConnectionStore } from '../core/connectionStore';
 import { DriverRegistry } from '../core/driverRegistry';
 import { EditTarget, resolveEditTarget } from '../core/editTarget';
@@ -1130,16 +1137,24 @@ async function openObjectEditor(deps: CommandDeps, profileId: string, request: O
   const load = async (): Promise<ObjectEditorModel> => {
     if (tableTarget) {
       const structure = await driver.describeTable!(tableTarget);
+      // 结构化的编辑描述在这里算好：Webview 只渲染控件，不参与类型文本与子句的拼装
+      const allowAutoUpdate = !!structure.allowAutoUpdate;
       return {
         mode: 'table',
         title: tableDataPanelTitle(tableTarget),
         objectLabel: '数据表',
         connectionLabel,
         properties: structure.properties,
-        columns: structure.columns,
-        dataTypes: structure.dataTypes,
+        columns: structure.columns.map((column) => ({
+          ...column,
+          typeEditor: describeColumnTypeEditor(column.dataType),
+          defaultEditor: describeColumnDefaultEditor(column),
+          onUpdate: describeOnUpdate(column.extraClauses, allowAutoUpdate, column.dataType),
+        })),
+        typeOptions: baseTypeOptions(structure.dataTypes ?? []),
         allowReorder: structure.allowReorder,
         allowAutoIncrement: structure.allowAutoIncrement,
+        allowAutoUpdate,
         limitations: structure.limitations,
         ddl: structure.ddl,
         readOnly: !!connected.session.profile.readOnly,
@@ -1168,7 +1183,11 @@ async function openObjectEditor(deps: CommandDeps, profileId: string, request: O
   const generate = async (change: ObjectEditorChange) => {
     const properties = change.properties ?? {};
     if (tableTarget) {
-      return driver.planTableChange!({ target: tableTarget, columns: change.columns ?? [], properties });
+      return driver.planTableChange!({
+        target: tableTarget,
+        columns: resolveEditorColumns(change.columns ?? []),
+        properties,
+      });
     }
     return driver.planDatabaseChange!({ target: databaseTarget!, properties });
   };
@@ -1186,7 +1205,11 @@ async function openObjectEditor(deps: CommandDeps, profileId: string, request: O
         return undefined;
       }
       const result = tableTarget
-        ? await driver.applyTableChange!({ target: tableTarget, columns: change.columns ?? [], properties: change.properties ?? {} })
+        ? await driver.applyTableChange!({
+            target: tableTarget,
+            columns: resolveEditorColumns(change.columns ?? []),
+            properties: change.properties ?? {},
+          })
         : await driver.applyDatabaseChange!({ target: databaseTarget!, properties: change.properties ?? {} });
       refreshTree();
       vscode.window.setStatusBarMessage(`已执行 ${result.executed} 条语句`, 4000);
